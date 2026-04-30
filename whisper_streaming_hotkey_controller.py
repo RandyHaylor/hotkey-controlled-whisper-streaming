@@ -19,6 +19,7 @@ The whisper_streaming server must be running separately on 127.0.0.1:43007
 
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -27,6 +28,21 @@ from pynput import keyboard as pynput_keyboard
 
 
 SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
+
+WHISPER_STREAMING_SERVER_HOST = os.environ.get("SERVER_HOST", "127.0.0.1")
+WHISPER_STREAMING_SERVER_PORT = int(os.environ.get("SERVER_PORT", "43007"))
+
+
+def is_whisper_streaming_server_reachable():
+    """Quick TCP probe — same semantics as `nc -z`."""
+    try:
+        with socket.create_connection(
+            (WHISPER_STREAMING_SERVER_HOST, WHISPER_STREAMING_SERVER_PORT),
+            timeout=0.5,
+        ):
+            return True
+    except (OSError, socket.timeout):
+        return False
 
 LAUNCHER_PATHS_BY_MODE_LABEL = {
     "mic-to-window-only": os.path.join(
@@ -123,18 +139,39 @@ class WhisperStreamingHotkeyController:
         friendly_message = FRIENDLY_START_MESSAGE_BY_MODE_LABEL.get(
             requested_mode_label, requested_mode_label
         )
+        # Reachability check — fail loudly if the server isn't up.
+        if not is_whisper_streaming_server_reachable():
+            print(
+                f"{ANSI_ERASE_CURRENT_LINE_PREFIX}"
+                f"VTT service (whisper_streaming server) unavailable. "
+                f"Relaunch this app.",
+                flush=True,
+            )
+            schedule_erase_of_trailing_echo_on_current_line()
+            return
         with self.subprocess_state_lock:
             # Same mode already running -> no-op (with friendly notice).
             if self.active_mode_label_or_none == requested_mode_label:
-                print(f"(already running) {friendly_message}", flush=True)
+                print(
+                    f"{ANSI_ERASE_CURRENT_LINE_PREFIX}"
+                    f"(already running) {friendly_message}",
+                    flush=True,
+                )
                 schedule_erase_of_trailing_echo_on_current_line()
                 return
             # Different mode running -> transition: stop current, start new.
             if self.active_subprocess_or_none is not None:
-                print("Switching modes...", flush=True)
+                print(
+                    f"{ANSI_ERASE_CURRENT_LINE_PREFIX}Switching modes...",
+                    flush=True,
+                )
                 self._terminate_active_subprocess_holding_lock()
             launcher_path = LAUNCHER_PATHS_BY_MODE_LABEL[requested_mode_label]
-            print(friendly_message, flush=True)
+            # Prefix erase wipes any F-key echo that arrived during terminate.
+            print(
+                f"{ANSI_ERASE_CURRENT_LINE_PREFIX}{friendly_message}",
+                flush=True,
+            )
             self.active_subprocess_or_none = subprocess.Popen(
                 [launcher_path],
                 # New process group so SIGTERM hits the whole pipeline.
@@ -167,12 +204,21 @@ class WhisperStreamingHotkeyController:
     def on_stop_hotkey_pressed(self):
         with self.subprocess_state_lock:
             if self.active_subprocess_or_none is None:
-                print("(nothing was running.)", flush=True)
+                print(
+                    f"{ANSI_ERASE_CURRENT_LINE_PREFIX}(nothing was running.)",
+                    flush=True,
+                )
                 schedule_erase_of_trailing_echo_on_current_line()
                 return
-            print("Stopping...", flush=True)
+            print(
+                f"{ANSI_ERASE_CURRENT_LINE_PREFIX}Stopping...",
+                flush=True,
+            )
             self._terminate_active_subprocess_holding_lock()
-            print("vtt stopped.", flush=True)
+            print(
+                f"{ANSI_ERASE_CURRENT_LINE_PREFIX}vtt stopped.",
+                flush=True,
+            )
             schedule_erase_of_trailing_echo_on_current_line()
 
     def run_until_interrupted(self):

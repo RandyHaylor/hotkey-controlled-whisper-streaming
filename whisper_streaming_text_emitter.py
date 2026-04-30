@@ -13,7 +13,7 @@ import subprocess
 def emit_committed_text_via_xdotool(text_to_type):
     if not text_to_type:
         return
-    print(f"[emit] {text_to_type}", flush=True)
+    print(text_to_type, flush=True)
     # Leading space so consecutive emissions concatenate naturally.
     text_with_leading_space = " " + text_to_type.lstrip()
     try:
