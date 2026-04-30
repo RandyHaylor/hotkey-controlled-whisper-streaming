@@ -29,43 +29,88 @@ from pynput import keyboard as pynput_keyboard
 SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 
 LAUNCHER_PATHS_BY_MODE_LABEL = {
-    "mic-typing-ctrl-v": os.path.join(
+    "mic-to-window-only": os.path.join(
+        SCRIPT_DIRECTORY,
+        "launch_whisper_streaming_mic_to_console_only.sh",
+    ),
+    "mic-to-typing": os.path.join(
         SCRIPT_DIRECTORY,
         "launch_whisper_streaming_mic_client_with_typing.sh",
     ),
-    "mic-typing-ctrl-shift-v": os.path.join(
-        SCRIPT_DIRECTORY,
-        # NOTE: this currently uses xdotool type (not Ctrl+Shift+V) under
-        # the hood. If you want a true Ctrl+Shift+V paste, swap the
-        # launcher's emitter call. Functionally types into terminals fine.
-        "launch_whisper_streaming_mic_client_with_typing.sh",
-    ),
-    "system-audio-to-console-and-file": os.path.join(
+    "system-audio-to-file": os.path.join(
         SCRIPT_DIRECTORY,
         "launch_whisper_streaming_system_audio_to_console_and_file.sh",
     ),
-    "mic-plus-system-to-console-and-file": os.path.join(
+    "mic-plus-system-to-file": os.path.join(
         SCRIPT_DIRECTORY,
         "launch_whisper_streaming_mic_plus_system_to_console_and_file.sh",
+    ),
+    "mic-to-file": os.path.join(
+        SCRIPT_DIRECTORY,
+        "launch_whisper_streaming_mic_to_console_and_file.sh",
     ),
 }
 
 HOTKEY_TO_MODE_LABEL = {
     # Distinct F-keys with single Ctrl modifier — no hotkey is a subset of
     # another, so pynput.GlobalHotKeys can match them exclusively.
-    "<ctrl>+<f9>": "mic-typing-ctrl-v",
-    "<ctrl>+<f10>": "system-audio-to-console-and-file",
-    "<ctrl>+<f11>": "mic-plus-system-to-console-and-file",
+    "<ctrl>+<f7>": "mic-to-window-only",
+    "<ctrl>+<f8>": "mic-to-typing",
+    "<ctrl>+<f9>": "system-audio-to-file",
+    "<ctrl>+<f10>": "mic-plus-system-to-file",
+    "<ctrl>+<f11>": "mic-to-file",
 }
 
 STOP_HOTKEY = "<ctrl>+<f12>"
 
 HUMAN_READABLE_HOTKEY_HELP_LINES = [
-    "  Ctrl+F9   -> mic dictation, types into focused window",
-    "  Ctrl+F10  -> system audio -> ~/vtt_recordings/*.txt",
-    "  Ctrl+F11  -> mic + system audio mixed -> ~/vtt_recordings/*.txt",
+    "  Ctrl+F7   -> mic -> show in this window only (no typing, no file)",
+    "  Ctrl+F8   -> mic dictation, types into focused window",
+    "  Ctrl+F9   -> system audio -> ~/vtt_recordings/*.txt",
+    "  Ctrl+F10  -> system audio + mic mixed -> ~/vtt_recordings/*.txt",
+    "  Ctrl+F11  -> mic -> ~/vtt_recordings/*.txt",
     "  Ctrl+F12  -> stop whatever is running",
 ]
+
+FRIENDLY_START_MESSAGE_BY_MODE_LABEL = {
+    "mic-to-window-only":
+        "Streaming mic to this preview window only...",
+    "mic-to-typing":
+        "Streaming mic dictation — typing into the focused window...",
+    "system-audio-to-file":
+        "Streaming system audio to ~/vtt_recordings/*.txt ...",
+    "mic-plus-system-to-file":
+        "Streaming mic + system audio (mixed) to ~/vtt_recordings/*.txt ...",
+    "mic-to-file":
+        "Streaming mic to ~/vtt_recordings/*.txt ...",
+}
+
+
+# ANSI escape: carriage-return + erase-to-end-of-line. Used to wipe the
+# echoed F-key sequence (e.g. "^[[18;5~") off the current line before we
+# print our friendly status message.
+ANSI_ERASE_CURRENT_LINE_PREFIX = "\r\033[K"
+
+# pynput's keyboard callback fires before the X server delivers the
+# F-key to the focused terminal, so our message prints first and then
+# the terminal echoes "^[[18;5~" on the line below it. To wipe that
+# trailing echo, we schedule a deferred line-clear shortly after.
+TRAILING_ECHO_ERASE_DELAY_SECONDS = 0.02
+
+
+def schedule_erase_of_trailing_echo_on_current_line():
+    """
+    Print a deferred carriage-return + erase-to-end-of-line ANSI sequence
+    after the X server has finished echoing the F-key escape sequence
+    (e.g. "^[[18;5~") onto the terminal. We don't move the cursor up —
+    we just erase whatever lands on the current line.
+    """
+    def deferred_clear():
+        sys.stdout.write(ANSI_ERASE_CURRENT_LINE_PREFIX)
+        sys.stdout.flush()
+    threading.Timer(
+        TRAILING_ECHO_ERASE_DELAY_SECONDS, deferred_clear
+    ).start()
 
 
 class WhisperStreamingHotkeyController:
@@ -75,30 +120,28 @@ class WhisperStreamingHotkeyController:
         self.subprocess_state_lock = threading.Lock()
 
     def on_mode_hotkey_pressed(self, requested_mode_label):
+        friendly_message = FRIENDLY_START_MESSAGE_BY_MODE_LABEL.get(
+            requested_mode_label, requested_mode_label
+        )
         with self.subprocess_state_lock:
-            # Same mode already running -> no-op.
+            # Same mode already running -> no-op (with friendly notice).
             if self.active_mode_label_or_none == requested_mode_label:
-                print(
-                    f"[start] mode '{requested_mode_label}' already running.",
-                    flush=True,
-                )
+                print(f"(already running) {friendly_message}", flush=True)
+                schedule_erase_of_trailing_echo_on_current_line()
                 return
             # Different mode running -> transition: stop current, start new.
             if self.active_subprocess_or_none is not None:
-                print(
-                    f"[transition] stopping '{self.active_mode_label_or_none}' "
-                    f"-> starting '{requested_mode_label}'",
-                    flush=True,
-                )
+                print("Switching modes...", flush=True)
                 self._terminate_active_subprocess_holding_lock()
             launcher_path = LAUNCHER_PATHS_BY_MODE_LABEL[requested_mode_label]
-            print(f"[start] mode={requested_mode_label}", flush=True)
+            print(friendly_message, flush=True)
             self.active_subprocess_or_none = subprocess.Popen(
                 [launcher_path],
                 # New process group so SIGTERM hits the whole pipeline.
                 preexec_fn=os.setsid,
             )
             self.active_mode_label_or_none = requested_mode_label
+            schedule_erase_of_trailing_echo_on_current_line()
 
     def _terminate_active_subprocess_holding_lock(self):
         """Caller must hold self.subprocess_state_lock."""
@@ -124,26 +167,26 @@ class WhisperStreamingHotkeyController:
     def on_stop_hotkey_pressed(self):
         with self.subprocess_state_lock:
             if self.active_subprocess_or_none is None:
-                print("[stop] already stopped.", flush=True)
+                print("(nothing was running.)", flush=True)
+                schedule_erase_of_trailing_echo_on_current_line()
                 return
-            print(
-                f"[stop] terminating mode "
-                f"'{self.active_mode_label_or_none}'...",
-                flush=True,
-            )
+            print("Stopping...", flush=True)
             self._terminate_active_subprocess_holding_lock()
-            print("[stop] done.", flush=True)
+            print("vtt stopped.", flush=True)
+            schedule_erase_of_trailing_echo_on_current_line()
 
     def run_until_interrupted(self):
-        print("", flush=True)
-        print("=" * 60, flush=True)
-        print(" Voice-to-Text (vtt) — global hotkeys:", flush=True)
-        print("=" * 60, flush=True)
-        for help_line in HUMAN_READABLE_HOTKEY_HELP_LINES:
-            print(help_line, flush=True)
-        print("=" * 60, flush=True)
-        print(" Ctrl+C in this terminal to exit the controller.", flush=True)
-        print("", flush=True)
+        # If the wrapper (vtt) drew the sticky banner already, skip ours.
+        if not os.environ.get("VTT_SUPPRESS_BANNER"):
+            print("", flush=True)
+            print("=" * 60, flush=True)
+            print(" Voice-to-Text (vtt) — global hotkeys:", flush=True)
+            print("=" * 60, flush=True)
+            for help_line in HUMAN_READABLE_HOTKEY_HELP_LINES:
+                print(help_line, flush=True)
+            print("=" * 60, flush=True)
+            print(" Ctrl+C in this terminal to exit the controller.", flush=True)
+            print("", flush=True)
 
         global_hotkey_callback_map = {
             hotkey_string: (lambda mode=mode_label:
