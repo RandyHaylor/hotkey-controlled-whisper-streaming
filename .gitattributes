@@ -1,1 +1,4 @@
 models/base/model.bin filter=lfs diff=lfs merge=lfs -text
+models/base.en/model.bin filter=lfs diff=lfs merge=lfs -text
+models/tiny/model.bin filter=lfs diff=lfs merge=lfs -text
+models/tiny.en/model.bin filter=lfs diff=lfs merge=lfs -text

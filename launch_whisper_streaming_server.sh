@@ -39,10 +39,16 @@ else
     WHISPER_ONLINE_SERVER_MODEL_ARGS=(--model "$WHISPER_MODEL")
 fi
 
-cd "$WHISPER_STREAMING_DIR"
+# WHISPER_DEVICE env var: "cuda" (default) or "cpu". Read by the runner
+# wrapper so it can monkey-patch FasterWhisperASR before the server boots.
+export WHISPER_DEVICE="${WHISPER_DEVICE:-cuda}"
 
-echo "Starting whisper_streaming server on GPU index ${CUDA_VISIBLE_DEVICES}, model=${WHISPER_MODEL}, ${SERVER_HOST}:${SERVER_PORT}"
-python3 whisper_online_server.py \
+# Run from the repo root (NOT inside whisper_streaming/) so the wrapper
+# can find the submodule + the local models/ directory.
+cd "$SCRIPT_DIR"
+
+echo "Starting whisper_streaming server: device=${WHISPER_DEVICE}, model=${WHISPER_MODEL}, GPU index=${CUDA_VISIBLE_DEVICES}, ${SERVER_HOST}:${SERVER_PORT}"
+python3 whisper_streaming_server_runner_with_device_choice.py \
     --host "$SERVER_HOST" \
     --port "$SERVER_PORT" \
     --backend faster-whisper \

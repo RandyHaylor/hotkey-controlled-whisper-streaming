@@ -7,9 +7,14 @@ venv/
 .vscode/
 .DS_Store
 # Locally-bundled faster-whisper model weights (downloaded by bootstrap_models.py).
-# Default base model is committed via Git LFS; other sizes are ignored to
-# avoid bloating LFS bandwidth on clones.
+# Smaller models (tiny / tiny.en, base / base.en) are committed; base is
+# tracked via Git LFS due to its 139 MB size; tiny/tiny.en (73 MB) fit
+# under the 100 MB plain-git limit. Other sizes are ignored to keep LFS
+# bandwidth reasonable.
 /models/*
+!/models/tiny/
+!/models/tiny.en/
 !/models/base/
+!/models/base.en/
 # Transcript output dir (per-user, auto-created).
 /vtt_recordings/

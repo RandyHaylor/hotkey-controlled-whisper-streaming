@@ -1,5 +1,5 @@
 @echo off
-REM One-click installer for hotkey-controlled-whisper-streaming on Windows.
+REM One-click installer for voice-to-text-type-tally on Windows.
 REM Delegates to install.ps1 which does the actual work.
 setlocal
 set "INSTALLER_SCRIPT_DIRECTORY=%~dp0"

@@ -1,6 +1,6 @@
-# hotkey-controlled-whisper-streaming
+# voice-to-text-type-tally
 
-[![CI](https://github.com/RandyHaylor/hotkey-controlled-whisper-streaming/actions/workflows/ci.yml/badge.svg)](https://github.com/RandyHaylor/hotkey-controlled-whisper-streaming/actions/workflows/ci.yml)
+[![CI](https://github.com/RandyHaylor/voice-to-text-type-tally/actions/workflows/ci.yml/badge.svg)](https://github.com/RandyHaylor/voice-to-text-type-tally/actions/workflows/ci.yml)
 
 Real-time voice dictation on Linux/X11 with global hotkey control. Uses
 [whisper_streaming](https://github.com/ufal/whisper_streaming) (LocalAgreement
@@ -43,8 +43,8 @@ server launcher).
 ## Setup
 
 ```bash
-git clone --recurse-submodules https://github.com/RandyHaylor/hotkey-controlled-whisper-streaming
-cd hotkey-controlled-whisper-streaming
+git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
+cd voice-to-text-type-tally
 chmod +x *.sh
 ```
 

@@ -1,4 +1,4 @@
-# One-click PowerShell installer for hotkey-controlled-whisper-streaming.
+# One-click PowerShell installer for voice-to-text-type-tally.
 # Downloads the v0.1.0 GitHub release source zip + the prebuilt
 # streaming_dictation.exe artifact, extracts to %USERPROFILE%\<repo>,
 # pip-installs requirements, and creates a Start Menu folder with
@@ -12,8 +12,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$gitHubRepoOwnerAndName = "RandyHaylor/hotkey-controlled-whisper-streaming"
-$installFolderName = "hotkey-controlled-whisper-streaming"
+$gitHubRepoOwnerAndName = "RandyHaylor/voice-to-text-type-tally"
+$installFolderName = "voice-to-text-type-tally"
 $installFullPath = Join-Path $InstallParentDirectory $installFolderName
 
 Write-Host "==> Installing $gitHubRepoOwnerAndName $ReleaseTag to: $installFullPath"

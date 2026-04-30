@@ -19,6 +19,7 @@ Run:
 import datetime
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -44,6 +45,45 @@ SERVER_READY_POLL_INTERVAL_SECONDS = 0.5
 SERVER_READY_TIMEOUT_SECONDS = 60.0
 
 TRANSCRIPTS_DIRECTORY = Path.home() / "vtt_recordings"
+
+LOCAL_MODELS_PARENT_DIRECTORY = Path(SCRIPT_DIRECTORY) / "models"
+DEFAULT_WHISPER_MODEL_NAME = "base"
+
+HELP_DOCUMENT_PATH = Path(SCRIPT_DIRECTORY) / "HELP.md"
+
+
+def is_nvidia_gpu_available_for_whisper():
+    """Probe `nvidia-smi -L`. Cross-platform — nvidia-smi exists wherever
+    NVIDIA drivers are installed (Linux/Windows/Mac-with-eGPU). Returns
+    False on any error (binary missing, no GPU, driver issue)."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        # `-L` lists GPUs; non-empty stdout AND exit 0 means a GPU is present.
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def list_locally_available_whisper_model_names():
+    """
+    Scan <repo>/models/ for subdirectories that contain a `model.bin` file.
+    Returns a sorted list of model names. Used to populate the model
+    dropdown — only what the user has on disk is shown. To add a new
+    model, drop a faster-whisper / CTranslate2 model directory into
+    <repo>/models/<name>/ and restart the GUI.
+    """
+    if not LOCAL_MODELS_PARENT_DIRECTORY.is_dir():
+        return []
+    model_names = []
+    for child in LOCAL_MODELS_PARENT_DIRECTORY.iterdir():
+        if child.is_dir() and (child / "model.bin").is_file():
+            model_names.append(child.name)
+    return sorted(model_names)
 
 LINUX_SERVER_LAUNCHER_PATH = os.path.join(
     SCRIPT_DIRECTORY, "launch_whisper_streaming_server.sh"
@@ -97,12 +137,59 @@ MODE_FILE_PREFIX = {
 
 
 def is_server_reachable():
+    """
+    True if the whisper_streaming server is up. Uses two checks:
+
+      (1) TCP connect probe to <host>:<port>. Confirms socket is bound.
+      (2) Process existence check by name. The whisper_streaming server
+          uses `s.listen(1)` (backlog=1), so during an active client
+          session the TCP probe can time out even though the server is
+          fine. Falling back to a process-name check avoids false DOWN.
+
+    Either succeeding -> reachable. Both failing -> down.
+    """
     try:
         with socket.create_connection(
             (SERVER_HOST, SERVER_PORT), timeout=SERVER_PROBE_TIMEOUT_SECONDS
         ):
             return True
     except (OSError, socket.timeout):
+        pass
+    return is_whisper_streaming_server_process_running()
+
+
+def is_whisper_streaming_server_process_running():
+    """Cross-platform process-name check. Avoids importing psutil.
+    Matches either the legacy direct invocation
+    (`whisper_online_server.py`) OR our cross-platform wrapper
+    (`whisper_streaming_server_runner_with_device_choice.py`)."""
+    system_name = platform.system()
+    try:
+        if system_name == "Windows":
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq python.exe"],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            stdout_text = result.stdout
+            return (
+                "whisper_online_server" in stdout_text
+                or "whisper_streaming_server_runner" in stdout_text
+            )
+        # Linux + macOS — pgrep with a single regex matching either name.
+        result = subprocess.run(
+            [
+                "pgrep",
+                "-f",
+                "whisper_online_server.py|whisper_streaming_server_runner_with_device_choice.py",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
 
 
@@ -314,7 +401,7 @@ class ModeRunner:
 class VttGuiApplication:
     def __init__(self):
         self.tk_root = tk.Tk()
-        self.tk_root.title("Voice-to-Text (vtt)")
+        self.tk_root.title("Voice-to-Text-Type-Tally (vtttt)")
         self.tk_root.geometry("780x560")
 
         self.server_subprocess_or_none = None
@@ -333,13 +420,26 @@ class VttGuiApplication:
 
         TRANSCRIPTS_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
+        # Auto-pick the compute device at first launch: GPU if available,
+        # else CPU. The user can switch later via the Start server (GPU/CPU)
+        # buttons.
+        os.environ["WHISPER_DEVICE"] = (
+            "cuda" if is_nvidia_gpu_available_for_whisper() else "cpu"
+        )
         self._start_server_async()
+        # Kick off the periodic server-health poll (updates the bottom-row
+        # indicator label every 2s). Schedule via after so it runs on the
+        # Tk main thread once the mainloop is up.
+        self.tk_root.after(500, self._poll_server_health_loop)
 
     # ---- UI ---------------------------------------------------------------
 
     def _build_widgets(self):
+        # Status bar widget — created here but NOT packed yet. Packed below
+        # the server controls row so it lives directly under the
+        # Start/Stop server buttons rather than at the very top.
         self.status_var = tk.StringVar(value="Server: starting...   Mode: idle")
-        status_bar = tk.Label(
+        self.status_bar_widget = tk.Label(
             self.tk_root,
             textvariable=self.status_var,
             anchor="w",
@@ -348,7 +448,6 @@ class VttGuiApplication:
             padx=6,
             pady=3,
         )
-        status_bar.pack(side=tk.TOP, fill=tk.X)
 
         button_frame = tk.Frame(self.tk_root)
         button_frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=6)
@@ -385,15 +484,41 @@ class VttGuiApplication:
             state=tk.DISABLED,
         )
 
-        for button_widget in (
-            self.button_mic_preview,
-            self.button_mic_typing,
-            self.button_mic_to_file,
-            self.button_system_to_file,
-            self.button_mixed_to_file,
-            self.button_stop,
-        ):
-            button_widget.pack(side=tk.LEFT, padx=3, pady=3)
+        # Lay buttons out in TWO ROWS via grid so they stay visible when the
+        # window is narrow (a single horizontal row gets clipped on shrink).
+        # Row 1: mic-related actions. Row 2: system-audio + stop.
+        button_grid_padding = {"padx": 3, "pady": 3, "sticky": "ew"}
+        self.button_mic_preview.grid(row=0, column=0, **button_grid_padding)
+        self.button_mic_typing.grid(row=0, column=1, **button_grid_padding)
+        self.button_mic_to_file.grid(row=0, column=2, **button_grid_padding)
+        self.button_system_to_file.grid(row=1, column=0, **button_grid_padding)
+        self.button_mixed_to_file.grid(row=1, column=1, **button_grid_padding)
+        self.button_stop.grid(row=1, column=2, **button_grid_padding)
+        # Make the three columns share width equally so buttons grow/shrink
+        # with the window instead of clipping.
+        for column_index in range(3):
+            button_frame.grid_columnconfigure(column_index, weight=1)
+
+        # Map mode label -> button widget so we can highlight the active
+        # mode and unhighlight others when modes change.
+        self.mode_label_to_button_widget = {
+            MODE_MIC_PREVIEW: self.button_mic_preview,
+            MODE_MIC_TYPING: self.button_mic_typing,
+            MODE_MIC_TO_FILE: self.button_mic_to_file,
+            MODE_SYSTEM_TO_FILE: self.button_system_to_file,
+            MODE_MIXED_TO_FILE: self.button_mixed_to_file,
+        }
+        # Capture each mode button's default visual state so we can restore
+        # it cleanly when the mode is no longer active.
+        self.mode_button_default_visual_state_by_widget = {
+            button_widget: {
+                "relief": button_widget.cget("relief"),
+                "bd": button_widget.cget("bd"),
+                "background": button_widget.cget("background"),
+                "foreground": button_widget.cget("foreground"),
+            }
+            for button_widget in self.mode_label_to_button_widget.values()
+        }
 
         if not self._loopback_available:
             self.button_system_to_file.config(state=tk.DISABLED)
@@ -402,23 +527,213 @@ class VttGuiApplication:
         # Disable mode buttons until server ready.
         self._set_mode_buttons_enabled(False)
 
+        # Small system-log widget (a few lines, light grey, read-only).
+        # Receives [server] / [mode] / error messages — not transcript text.
+        self.log_text_widget = scrolledtext.ScrolledText(
+            self.tk_root,
+            wrap=tk.WORD,
+            state=tk.DISABLED,
+            font=("TkDefaultFont", 9),
+            height=5,
+            background="#eeeeee",
+            foreground="#444444",
+        )
+        self.log_text_widget.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
+        )
+
+        # ---- Server controls row (directly under the mode buttons) -----
+        server_controls_frame = tk.Frame(self.tk_root)
+        server_controls_frame.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
+        )
+
+        self._gpu_is_available = is_nvidia_gpu_available_for_whisper()
+
+        self.button_start_server_gpu = tk.Button(
+            server_controls_frame,
+            text="Start server (GPU)",
+            command=lambda: self._on_start_server_with_device_clicked("cuda"),
+            state=tk.NORMAL if self._gpu_is_available else tk.DISABLED,
+        )
+        self.button_start_server_gpu.pack(side=tk.LEFT, padx=2)
+
+        self.button_start_server_cpu = tk.Button(
+            server_controls_frame,
+            text="Start server (CPU)",
+            command=lambda: self._on_start_server_with_device_clicked("cpu"),
+        )
+        self.button_start_server_cpu.pack(side=tk.LEFT, padx=2)
+
+        self.button_stop_server = tk.Button(
+            server_controls_frame,
+            text="Stop server",
+            command=self._on_stop_server_button_clicked,
+        )
+        self.button_stop_server.pack(side=tk.LEFT, padx=2)
+
+        # Model dropdown — display rich descriptive strings, but the
+        # underlying model name is recovered via the display->name map.
+        from tkinter import ttk as _tk_ttk_module
+        tk.Label(server_controls_frame, text="  Model:").pack(side=tk.LEFT)
+        locally_available_models = list_locally_available_whisper_model_names()
+        if not locally_available_models:
+            locally_available_models = [DEFAULT_WHISPER_MODEL_NAME]
+
+        # Per-model human description strings shown inside the dropdown.
+        # Models on disk are listed first; not-installed models are shown
+        # afterward with a "(not installed)" suffix and won't actually load
+        # if selected (we revert + log a hint about installing them).
+        whisper_model_description_by_name = {
+            "tiny":      "tiny      — ~75 MB · multilingual · fastest, lowest accuracy",
+            "tiny.en":   "tiny.en   — ~75 MB · English-only · slightly more accurate than tiny for English",
+            "base":      "base      — ~145 MB · multilingual · fast, decent accuracy",
+            "base.en":   "base.en   — ~145 MB · English-only · slightly more accurate than base for English",
+            "small":     "small     — ~485 MB · multilingual · good accuracy, sweet spot for many users",
+            "small.en":  "small.en  — ~485 MB · English-only · slightly more accurate than small for English",
+            "medium":    "medium    — ~1.5 GB · multilingual · great accuracy, slower",
+            "medium.en": "medium.en — ~1.5 GB · English-only · great accuracy for English",
+            "large-v1":  "large-v1  — ~3.0 GB · multilingual · older large variant",
+            "large-v2":  "large-v2  — ~3.0 GB · multilingual · stronger large variant",
+            "large-v3":  "large-v3  — ~3.0 GB · multilingual · best general accuracy",
+            "large":     "large     — ~3.0 GB · multilingual · alias for the latest large model",
+        }
+
+        # Track which models are actually present on disk so the
+        # selection-changed handler can refuse and revert when the user
+        # picks a not-installed entry.
+        self.locally_available_whisper_model_names_set = set(
+            locally_available_models
+        )
+
+        # Build display strings for ALL supported models. Visual marker:
+        #   ●  = installed locally (full / "darker" weight)
+        #   ○  = not on disk     (hollow / "lighter" weight)
+        # ttk.Combobox doesn't support per-row color theming portably, so
+        # we use the filled-vs-hollow circle prefix as the visual cue.
+        # Installed entries are listed FIRST so they appear at the top.
+        self.whisper_model_dropdown_display_to_name_map = {}
+        whisper_model_dropdown_display_strings = []
+
+        # Installed first.
+        for model_name in locally_available_models:
+            description = whisper_model_description_by_name.get(
+                model_name, f"{model_name}    — local model"
+            )
+            display_string = f"●  {description}"
+            whisper_model_dropdown_display_strings.append(display_string)
+            self.whisper_model_dropdown_display_to_name_map[display_string] = (
+                model_name
+            )
+
+        # Then known-but-not-installed.
+        for model_name in whisper_model_description_by_name:
+            if model_name in self.locally_available_whisper_model_names_set:
+                continue
+            description = whisper_model_description_by_name[model_name]
+            display_string = f"○  {description}"
+            whisper_model_dropdown_display_strings.append(display_string)
+            self.whisper_model_dropdown_display_to_name_map[display_string] = (
+                model_name
+            )
+
+        initial_model_choice = (
+            DEFAULT_WHISPER_MODEL_NAME
+            if DEFAULT_WHISPER_MODEL_NAME in locally_available_models
+            else locally_available_models[0]
+        )
+        # Find the display string for the initial choice.
+        initial_display_string = next(
+            (
+                display
+                for display, name in (
+                    self.whisper_model_dropdown_display_to_name_map.items()
+                )
+                if name == initial_model_choice
+            ),
+            whisper_model_dropdown_display_strings[0],
+        )
+        self.selected_whisper_model_dropdown_display_var = tk.StringVar(
+            value=initial_display_string
+        )
+        os.environ["WHISPER_MODEL"] = initial_model_choice
+        # Pick a width wide enough that the longest description doesn't
+        # clip; tk.Combobox width is in characters.
+        widest_display_length = max(
+            len(string) for string in whisper_model_dropdown_display_strings
+        )
+        self.whisper_model_dropdown = _tk_ttk_module.Combobox(
+            server_controls_frame,
+            textvariable=self.selected_whisper_model_dropdown_display_var,
+            values=whisper_model_dropdown_display_strings,
+            state="readonly",
+            width=min(widest_display_length, 70),
+        )
+        self.whisper_model_dropdown.pack(side=tk.LEFT, padx=(2, 0))
+        self.whisper_model_dropdown.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self._on_whisper_model_selection_changed(),
+        )
+
+        # Capture default visual state for GPU / CPU buttons so we can
+        # restore them after un-highlighting.
+        self.device_button_default_visual_state_by_widget = {
+            button_widget: {
+                "relief": button_widget.cget("relief"),
+                "bd": button_widget.cget("bd"),
+                "background": button_widget.cget("background"),
+                "foreground": button_widget.cget("foreground"),
+            }
+            for button_widget in (
+                self.button_start_server_gpu,
+                self.button_start_server_cpu,
+            )
+        }
+
+        # Pack the status bar BELOW the server controls row.
+        self.status_bar_widget.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
+        )
+
+        # ---- Transcript controls row (under the server controls) -------
+        transcript_controls_frame = tk.Frame(self.tk_root)
+        transcript_controls_frame.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 6)
+        )
+        tk.Button(
+            transcript_controls_frame,
+            text="Open transcripts folder",
+            command=lambda: open_folder_in_native_file_manager(TRANSCRIPTS_DIRECTORY),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Button(
+            transcript_controls_frame,
+            text="Clear",
+            command=self._on_clear_transcript_button_clicked,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            transcript_controls_frame,
+            text="Copy all",
+            command=self._on_copy_all_transcript_button_clicked,
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(
+            transcript_controls_frame,
+            text="Help",
+            command=self._on_help_button_clicked,
+        ).pack(side=tk.LEFT, padx=2)
+        # No "Quit" button — the window's X close button already triggers
+        # _on_window_close via the WM_DELETE_WINDOW protocol binding.
+
+        # ---- Main transcript widget (expands to fill the rest) ---------
         self.transcript_text = scrolledtext.ScrolledText(
-            self.tk_root, wrap=tk.WORD, state=tk.DISABLED, font=("TkDefaultFont", 11)
+            self.tk_root,
+            wrap=tk.WORD,
+            state=tk.NORMAL,
+            font=("TkDefaultFont", 11),
+            background="#ffffff",
         )
         self.transcript_text.pack(
             side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(0, 6)
         )
-
-        bottom_frame = tk.Frame(self.tk_root)
-        bottom_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=6, pady=6)
-        tk.Button(
-            bottom_frame,
-            text="Open transcripts folder",
-            command=lambda: open_folder_in_native_file_manager(TRANSCRIPTS_DIRECTORY),
-        ).pack(side=tk.LEFT)
-        tk.Button(
-            bottom_frame, text="Quit", command=self._on_window_close
-        ).pack(side=tk.RIGHT)
 
     def _set_mode_buttons_enabled(self, is_enabled):
         normal_or_disabled = tk.NORMAL if is_enabled else tk.DISABLED
@@ -437,42 +752,301 @@ class VttGuiApplication:
         self.tk_root.after(0, self._append_transcript_text, text)
 
     def _append_transcript_text(self, text):
-        self.transcript_text.config(state=tk.NORMAL)
+        # Transcript widget is editable so the user can select/copy/edit.
+        # Inserts go at the end regardless of cursor position so user edits
+        # don't disrupt incoming text.
         self.transcript_text.insert(tk.END, text)
         self.transcript_text.see(tk.END)
-        self.transcript_text.config(state=tk.DISABLED)
+
+    def _append_log_text(self, text):
+        """Write a system/log message (server status, mode events, errors)
+        into the small log widget at the top — NOT the transcript widget."""
+        self.log_text_widget.config(state=tk.NORMAL)
+        self.log_text_widget.insert(tk.END, text)
+        self.log_text_widget.see(tk.END)
+        self.log_text_widget.config(state=tk.DISABLED)
+
+    def _set_active_device_button_highlight(self, active_device_or_none):
+        """Highlight the GPU or CPU server button based on which device the
+        running server is using. `active_device_or_none` is "cuda", "cpu",
+        or None (no server running)."""
+        device_to_button = {
+            "cuda": self.button_start_server_gpu,
+            "cpu": self.button_start_server_cpu,
+        }
+        for device_name, button_widget in device_to_button.items():
+            default_visual_state = (
+                self.device_button_default_visual_state_by_widget[button_widget]
+            )
+            if device_name == active_device_or_none:
+                button_widget.config(
+                    relief=tk.SUNKEN,
+                    bd=3,
+                    background="#a5d6a7",  # soft green for "currently running"
+                    foreground="#000000",
+                )
+            else:
+                button_widget.config(
+                    relief=default_visual_state["relief"],
+                    bd=default_visual_state["bd"],
+                    background=default_visual_state["background"],
+                    foreground=default_visual_state["foreground"],
+                )
+
+    def _set_active_mode_button_highlight(self, active_mode_label_or_none):
+        """Visually highlight the button corresponding to the active mode
+        and unhighlight the others. Call with None when no mode is active."""
+        for mode_label, button_widget in self.mode_label_to_button_widget.items():
+            default_visual_state = (
+                self.mode_button_default_visual_state_by_widget[button_widget]
+            )
+            if mode_label == active_mode_label_or_none:
+                button_widget.config(
+                    relief=tk.SUNKEN,
+                    bd=3,
+                    background="#ffe082",  # warm amber for "currently running"
+                    foreground="#000000",
+                )
+            else:
+                button_widget.config(
+                    relief=default_visual_state["relief"],
+                    bd=default_visual_state["bd"],
+                    background=default_visual_state["background"],
+                    foreground=default_visual_state["foreground"],
+                )
+
+    def _on_whisper_model_selection_changed(self):
+        """Stop the running server (if any) and restart with the new model
+        name in the WHISPER_MODEL env var. If the user picked a model
+        that isn't on disk, log a hint and revert the dropdown to the
+        currently-running model."""
+        selected_display_string = (
+            self.selected_whisper_model_dropdown_display_var.get()
+        )
+        new_model_name = self.whisper_model_dropdown_display_to_name_map.get(
+            selected_display_string, selected_display_string
+        )
+
+        if new_model_name not in self.locally_available_whisper_model_names_set:
+            # Refuse the change; revert dropdown selection to the current
+            # model and log a friendly hint.
+            current_model_name = os.environ.get(
+                "WHISPER_MODEL", DEFAULT_WHISPER_MODEL_NAME
+            )
+            current_display_string = next(
+                (
+                    display
+                    for display, name in (
+                        self.whisper_model_dropdown_display_to_name_map.items()
+                    )
+                    if name == current_model_name
+                    and "(not installed)" not in display
+                ),
+                None,
+            )
+            if current_display_string is not None:
+                self.selected_whisper_model_dropdown_display_var.set(
+                    current_display_string
+                )
+            self._append_log_text(
+                f"[model] '{new_model_name}' is not present locally — "
+                f"read Help for download instructions.\n"
+                f"        Currently using: {current_model_name}\n"
+            )
+            return
+        os.environ["WHISPER_MODEL"] = new_model_name
+        self._append_log_text(
+            f"[model] switching to '{new_model_name}' — restarting server...\n"
+        )
+        # Reuse the stop+start machinery.
+        self._on_stop_server_button_clicked()
+        # Brief delay so pkill clears the listening socket before relaunch.
+        self.tk_root.after(700, self._start_server_async)
+
+    def _on_help_button_clicked(self):
+        help_window = tk.Toplevel(self.tk_root)
+        help_window.title("Voice-to-Text-Type-Tally — Help")
+        help_window.geometry("720x540")
+        help_text_widget = scrolledtext.ScrolledText(
+            help_window,
+            wrap=tk.WORD,
+            font=("TkDefaultFont", 10),
+        )
+        help_text_widget.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        try:
+            help_document_contents = HELP_DOCUMENT_PATH.read_text(encoding="utf-8")
+        except Exception as read_error:
+            help_document_contents = (
+                f"Could not read {HELP_DOCUMENT_PATH}: {read_error}\n"
+            )
+        help_text_widget.insert(tk.END, help_document_contents)
+        help_text_widget.config(state=tk.DISABLED)
+        tk.Button(
+            help_window, text="Close", command=help_window.destroy
+        ).pack(side=tk.BOTTOM, pady=(0, 8))
+
+    def _on_clear_transcript_button_clicked(self):
+        self.transcript_text.delete("1.0", tk.END)
+
+    def _on_copy_all_transcript_button_clicked(self):
+        full_text = self.transcript_text.get("1.0", tk.END)
+        try:
+            self.tk_root.clipboard_clear()
+            self.tk_root.clipboard_append(full_text)
+            # Force tk to actually push the text into the X clipboard.
+            self.tk_root.update_idletasks()
+            self._append_log_text("[ui] transcript copied to clipboard.\n")
+        except Exception as clipboard_error:
+            self._append_log_text(
+                f"[ui] copy failed: {clipboard_error}\n"
+            )
 
     # ---- Server lifecycle -------------------------------------------------
 
-    def _start_server_async(self):
-        system_name = platform.system()
-        if system_name == "Linux" and os.path.isfile(LINUX_SERVER_LAUNCHER_PATH):
-            try:
-                popen_kwargs = {
-                    "stdout": subprocess.DEVNULL,
-                    "stderr": subprocess.DEVNULL,
-                }
-                if hasattr(os, "setsid"):
-                    popen_kwargs["preexec_fn"] = os.setsid
-                self.server_subprocess_or_none = subprocess.Popen(
-                    ["bash", LINUX_SERVER_LAUNCHER_PATH], **popen_kwargs
-                )
-                self._set_status("starting...", "idle")
-            except Exception as error:
-                self._set_status(
-                    f"failed to launch ({error})", "idle"
-                )
+    def _build_server_command_argv(self):
+        """Cross-platform: build argv to invoke our wrapper that starts the
+        whisper_streaming server with the user's WHISPER_DEVICE / WHISPER_MODEL
+        env-driven choices. Returns the argv list (caller wraps in a
+        terminal-spawning command for visibility)."""
+        wrapper_script_path = os.path.join(
+            SCRIPT_DIRECTORY,
+            "whisper_streaming_server_runner_with_device_choice.py",
+        )
+        whisper_model_name = os.environ.get(
+            "WHISPER_MODEL", DEFAULT_WHISPER_MODEL_NAME
+        )
+        local_model_directory = (
+            LOCAL_MODELS_PARENT_DIRECTORY / whisper_model_name
+        )
+        if (local_model_directory / "model.bin").is_file():
+            # Pass BOTH --model and --model_dir: --model_dir is used for the
+            # actual load path; --model is purely for log readability so
+            # the server's "Loading Whisper <name>" message reflects the
+            # real choice instead of the argparse default ("large-v2").
+            model_args = [
+                "--model", whisper_model_name,
+                "--model_dir", str(local_model_directory),
+            ]
         else:
-            instruction_text = MANUAL_SERVER_INSTRUCTIONS_BY_OS.get(
-                system_name, "Start the whisper_streaming server manually."
+            model_args = ["--model", whisper_model_name]
+        return [
+            sys.executable,
+            wrapper_script_path,
+            "--host", SERVER_HOST,
+            "--port", str(SERVER_PORT),
+            "--backend", "faster-whisper",
+            *model_args,
+            "--lan", "en",
+            "--min-chunk-size", "0.5",
+            "--buffer_trimming", "segment",
+            "--buffer_trimming_sec", "8",
+            "--vad",
+            "-l", "INFO",
+        ]
+
+    def _spawn_server_process_in_visible_window(self, server_argv):
+        """Open a platform-appropriate visible terminal window running the
+        server. Returns the Popen handle of the WRAPPER process (which may
+        itself be a terminal launcher; the actual python child detaches)."""
+        system_name = platform.system()
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if hasattr(os, "setsid"):
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        if system_name == "Linux":
+            if shutil.which("gnome-terminal"):
+                # Use bash -lc with a single string so the working dir is
+                # the repo root. Trail with `; exec bash` so the terminal
+                # stays open if the server crashes — otherwise the window
+                # closes before the user can read any traceback.
+                command_string = " ".join(
+                    self._shell_quote(part) for part in server_argv
+                )
+                command_string += "; echo; echo '[vtt-server] process exited.'; exec bash"
+                return subprocess.Popen(
+                    [
+                        "gnome-terminal",
+                        "--title=vtt-server",
+                        "--working-directory", SCRIPT_DIRECTORY,
+                        "--",
+                        "bash", "-lc", command_string,
+                    ],
+                    **popen_kwargs,
+                )
+            return subprocess.Popen(
+                server_argv, cwd=SCRIPT_DIRECTORY, **popen_kwargs
             )
-            self._set_status(
-                "manual start required (see message)", "idle"
+
+        if system_name == "Darwin":
+            # macOS: open Terminal.app via osascript and run our command.
+            command_string = (
+                f"cd {self._shell_quote(SCRIPT_DIRECTORY)} && "
+                + " ".join(self._shell_quote(part) for part in server_argv)
             )
-            self._append_transcript_text(
-                f"[server] Auto-launch not supported on {system_name}.\n"
-                f"{instruction_text}\n\n"
+            applescript_command = (
+                f'tell application "Terminal" to do script "{command_string}"'
             )
+            return subprocess.Popen(
+                ["osascript", "-e", applescript_command],
+                **popen_kwargs,
+            )
+
+        if system_name == "Windows":
+            # Windows: spawn a new console window via `start`.
+            quoted = " ".join(
+                f'"{part}"' if " " in part else part for part in server_argv
+            )
+            command_string = f'start "vtt-server" cmd /K {quoted}'
+            return subprocess.Popen(
+                command_string, cwd=SCRIPT_DIRECTORY, shell=True
+            )
+
+        # Unknown OS → silent background.
+        return subprocess.Popen(
+            server_argv, cwd=SCRIPT_DIRECTORY, **popen_kwargs
+        )
+
+    @staticmethod
+    def _shell_quote(text):
+        """Minimal POSIX shell-quoting for embedding argv parts in a
+        single bash -lc string."""
+        if all(c.isalnum() or c in "/._-=:," for c in text):
+            return text
+        return "'" + text.replace("'", r"'\''") + "'"
+
+    def _start_server_async(self):
+        try:
+            server_argv = self._build_server_command_argv()
+            self.server_subprocess_or_none = (
+                self._spawn_server_process_in_visible_window(server_argv)
+            )
+            self._set_status("starting...", "idle")
+            self._append_log_text(
+                f"[server] launched ({platform.system()}, "
+                f"device={os.environ.get('WHISPER_DEVICE','cuda')}, "
+                f"model={os.environ.get('WHISPER_MODEL', DEFAULT_WHISPER_MODEL_NAME)}).\n"
+            )
+            # On Linux/Mac, the new terminal window grabs focus; raise the
+            # GUI back to the front shortly after.
+            def raise_gui_window_to_front():
+                try:
+                    self.tk_root.lift()
+                    self.tk_root.attributes("-topmost", True)
+                    self.tk_root.after(
+                        300,
+                        lambda: self.tk_root.attributes("-topmost", False),
+                    )
+                    self.tk_root.focus_force()
+                except Exception:
+                    pass
+            self.tk_root.after(600, raise_gui_window_to_front)
+            self.tk_root.after(1500, raise_gui_window_to_front)
+        except Exception as error:
+            self._set_status(f"failed to launch ({error})", "idle")
+            self._append_log_text(f"[server] launch error: {error}\n")
 
         threading.Thread(
             target=self._await_server_ready_then_enable_ui,
@@ -502,6 +1076,95 @@ class VttGuiApplication:
     def _on_server_ready(self):
         self._set_status("ready", "idle")
         self._set_mode_buttons_enabled(True)
+        self._set_active_device_button_highlight(
+            os.environ.get("WHISPER_DEVICE", "cuda")
+        )
+
+    # ---- Server start/stop buttons + health indicator ---------------------
+
+    def _on_start_server_button_clicked(self):
+        if is_server_reachable():
+            self._append_log_text(
+                "[server] already reachable — start request ignored.\n"
+            )
+            return
+        self._append_log_text("[server] starting...\n")
+        self._start_server_async()
+
+    def _on_start_server_with_device_clicked(self, device_name):
+        """Stop any running server and (re)start it using the selected
+        compute device ("cuda" or "cpu"). Sets WHISPER_DEVICE env var so
+        the wrapper knows which path to take. Always tears down any
+        existing server first (regardless of which device it was using)
+        so the new launch can bind the port cleanly."""
+        os.environ["WHISPER_DEVICE"] = device_name
+        self._append_log_text(
+            f"[server] requested start on {device_name.upper()}.\n"
+        )
+        # Always force-stop any running server first. is_server_reachable()
+        # would miss a server that's still starting up (process exists,
+        # socket not listening yet). The process-check is the safer gate.
+        if (
+            is_server_reachable()
+            or is_whisper_streaming_server_process_running()
+        ):
+            self._on_stop_server_button_clicked()
+            # Give the kernel time to release the listen port before the
+            # new server tries to bind it. 1500ms is conservative; the
+            # actual TIME_WAIT socket release on Linux is typically
+            # ~1s for a freshly-killed listener.
+            self.tk_root.after(1500, self._start_server_async)
+        else:
+            self._start_server_async()
+
+    def _on_stop_server_button_clicked(self):
+        # Use the same kill path as _on_window_close, but don't quit.
+        self._append_log_text("[server] stopping...\n")
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "whisper_online_server.py"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(
+                    [
+                        "pkill",
+                        "-f",
+                        "whisper_online_server.py|whisper_streaming_server_runner_with_device_choice.py",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            if shutil.which("wmctrl"):
+                subprocess.run(
+                    ["wmctrl", "-c", "vtt-server"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception as stop_error:
+            self._append_log_text(f"[server] stop error: {stop_error}\n")
+        self._set_mode_buttons_enabled(False)
+        self._set_status("stopped", "idle")
+        self._set_active_device_button_highlight(None)
+
+    def _poll_server_health_loop(self):
+        """Run on the Tk main thread every 2s. Updates the status bar's
+        Server: segment based on process-existence check. No TCP probe so
+        we don't spam the server log with connect/close cycles."""
+        # Preserve whatever Mode: segment is currently shown.
+        current_status_text = self.status_var.get()
+        current_mode_segment = "idle"
+        if "Mode:" in current_status_text:
+            current_mode_segment = current_status_text.split("Mode:", 1)[1].strip()
+        if is_whisper_streaming_server_process_running():
+            new_server_segment = "UP"
+        else:
+            new_server_segment = "DOWN"
+        self._set_status(new_server_segment, current_mode_segment)
+        # Re-schedule. Cancel happens implicitly when tk_root is destroyed.
+        self.tk_root.after(2000, self._poll_server_health_loop)
 
     # ---- Mode switching ---------------------------------------------------
 
@@ -567,8 +1230,9 @@ class VttGuiApplication:
 
         self._set_status("ready", MODE_HUMAN_LABEL[mode_label])
         self.button_stop.config(state=tk.NORMAL)
-        self._append_transcript_text(
-            f"\n[mode] started: {MODE_HUMAN_LABEL[mode_label]}"
+        self._set_active_mode_button_highlight(mode_label)
+        self._append_log_text(
+            f"[mode] started: {MODE_HUMAN_LABEL[mode_label]}"
             + (f"  -> {save_path_or_none}" if save_path_or_none else "")
             + "\n"
         )
@@ -587,6 +1251,10 @@ class VttGuiApplication:
             self._stop_active_runner_holding_lock()
         self._set_status("ready", "idle")
         self.button_stop.config(state=tk.DISABLED)
+        # The async _on_runner_finished path won't clear the highlight in
+        # this case because we just nulled active_mode_label_or_none above
+        # — its equality check fails. Clear the highlight here directly.
+        self._set_active_mode_button_highlight(None)
 
     def _on_runner_finished_threadsafe(self, finished_mode_label):
         self.tk_root.after(0, self._on_runner_finished, finished_mode_label)
@@ -599,6 +1267,7 @@ class VttGuiApplication:
                 self.active_mode_label_or_none = None
                 self._set_status("ready", "idle")
                 self.button_stop.config(state=tk.DISABLED)
+                self._set_active_mode_button_highlight(None)
 
     # ---- Shutdown ---------------------------------------------------------
 
@@ -609,6 +1278,41 @@ class VttGuiApplication:
         except Exception:
             pass
 
+        # Kill the whisper_streaming server. When we launched it inside
+        # gnome-terminal, our Popen handle points at gnome-terminal which
+        # has already detached from the actual python child — so we need
+        # to find the server by name. pkill is the simplest portable path
+        # on Linux/Mac. On Windows we use taskkill /IM via the python
+        # executable name.
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "whisper_online_server.py"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.run(
+                    [
+                        "pkill",
+                        "-f",
+                        "whisper_online_server.py|whisper_streaming_server_runner_with_device_choice.py",
+                    ],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            # Also close the gnome-terminal window if it's still up.
+            if shutil.which("wmctrl"):
+                subprocess.run(
+                    ["wmctrl", "-c", "vtt-server"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        except Exception:
+            pass
+
+        # As a fallback, also try the original Popen-handle termination
+        # in case we launched in headless mode (no gnome-terminal).
         if self.server_subprocess_or_none is not None:
             try:
                 if hasattr(os, "killpg") and hasattr(os, "getpgid"):
