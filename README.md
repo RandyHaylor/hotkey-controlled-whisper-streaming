@@ -1,5 +1,7 @@
 # hotkey-controlled-whisper-streaming
 
+[![CI](https://github.com/RandyHaylor/hotkey-controlled-whisper-streaming/actions/workflows/ci.yml/badge.svg)](https://github.com/RandyHaylor/hotkey-controlled-whisper-streaming/actions/workflows/ci.yml)
+
 Real-time voice dictation on Linux/X11 with global hotkey control. Uses
 [whisper_streaming](https://github.com/ufal/whisper_streaming) (LocalAgreement
 streaming over OpenAI Whisper) for transcription, and `xdotool type` to

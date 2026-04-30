@@ -1,0 +1,6 @@
+faster-whisper
+sounddevice
+librosa
+soundfile
+pynput
+pytest

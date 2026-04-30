@@ -27,20 +27,33 @@ def emit_committed_text_via_xdotool(text_to_type):
         print(f"[emit] ERROR: xdotool failed: {type_error}", flush=True)
 
 
+def parse_committed_text_from_server_line(stripped_line):
+    """Parse a whisper_streaming server output line.
+
+    Server line format: "<begin_ms> <end_ms> <text>" (e.g. "2610 3850 Okay so").
+    Returns the text portion if the line is a well-formed transcription line,
+    otherwise returns None (caller may treat as a status/info line).
+    """
+    if stripped_line is None:
+        return None
+    if not stripped_line.strip():
+        return None
+    line_parts = stripped_line.split(maxsplit=2)
+    if len(line_parts) < 3:
+        return None
+    begin_ms_string, end_ms_string, committed_text = line_parts
+    if not (begin_ms_string.isdigit() and end_ms_string.isdigit()):
+        return None
+    return committed_text
+
+
 def main():
     for raw_input_line in sys.stdin:
         stripped_line = raw_input_line.rstrip("\n")
-        if not stripped_line.strip():
-            continue
-        # Expect "<int> <int> <text>" — split on whitespace, max 3 parts.
-        line_parts = stripped_line.split(maxsplit=2)
-        if len(line_parts) < 3:
-            # Not a transcription line — print verbatim so we don't lose info.
-            print(f"[server] {stripped_line}", flush=True)
-            continue
-        begin_ms_string, end_ms_string, committed_text = line_parts
-        if not (begin_ms_string.isdigit() and end_ms_string.isdigit()):
-            print(f"[server] {stripped_line}", flush=True)
+        committed_text = parse_committed_text_from_server_line(stripped_line)
+        if committed_text is None:
+            if stripped_line.strip():
+                print(f"[server] {stripped_line}", flush=True)
             continue
         emit_committed_text_via_xdotool(committed_text)
 
