@@ -1,8 +1,8 @@
 #!/bin/bash
-# `vtt` entry point: ensures the whisper_streaming server is running on
-# 127.0.0.1:43007 (starts it in a new gnome-terminal window if not), then
-# runs the hotkey controller in the foreground with a sticky banner at
-# the bottom of the terminal.
+# `vtt` entry point: ALWAYS (re)starts a dedicated whisper_streaming server
+# in a new gnome-terminal window, runs the hotkey controller in the
+# foreground with a sticky banner at the bottom, and ALWAYS shuts the
+# server down on exit. Assumes this app is the only consumer of port 43007.
 #
 # Symlink this file into a directory on your PATH (e.g. ~/util_scripts/vtt)
 # so you can launch the whole voice-to-text app from anywhere by typing
@@ -10,60 +10,64 @@
 
 set -e
 
-# On any exit path: reset scroll region to full screen, restore tty, move
-# cursor below banner so the prompt doesn't land in the middle of it.
-restore_terminal_on_exit() {
+VTT_REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
+SERVER_PORT="${SERVER_PORT:-43007}"
+
+kill_any_existing_whisper_streaming_server() {
+    # pkill returns non-zero if no process matched — fine, ignore.
+    pkill -f "whisper_online_server.py" 2>/dev/null || true
+}
+
+shut_down_app_on_exit() {
     # Reset DEC scroll region to full screen.
     printf '\033[r'
     # Move cursor to bottom-left.
     tput cup "$(($(tput lines) - 1))" 0
     stty sane
-    # Show cursor (in case anyone hid it).
     tput cnorm
+    echo "[vtt] shutting down whisper_streaming server..."
+    kill_any_existing_whisper_streaming_server
 }
-trap restore_terminal_on_exit EXIT
+trap shut_down_app_on_exit EXIT
 
-VTT_REPO_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
-SERVER_PORT="${SERVER_PORT:-43007}"
+# Always start fresh: kill any prior server (this app's or stale).
+echo "[vtt] (re)starting dedicated whisper_streaming server..."
+kill_any_existing_whisper_streaming_server
+# Wait briefly for the port to free if a server was running.
+for waited_seconds in $(seq 1 5); do
+    nc -z "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null || break
+    sleep 1
+done
 
-if nc -z "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
-    echo "[vtt] whisper_streaming server already up at $SERVER_HOST:$SERVER_PORT"
+if command -v gnome-terminal >/dev/null 2>&1; then
+    gnome-terminal --title="vtt-server" -- bash -lc \
+        "$VTT_REPO_DIR/launch_whisper_streaming_server.sh; exec bash" \
+        >/dev/null 2>&1 &
 else
-    echo "[vtt] starting whisper_streaming server in a new gnome-terminal window..."
-    if command -v gnome-terminal >/dev/null 2>&1; then
-        gnome-terminal --title="vtt-server" -- bash -lc \
-            "$VTT_REPO_DIR/launch_whisper_streaming_server.sh; exec bash" \
-            >/dev/null 2>&1 &
-    else
-        mkdir -p "$HOME/vtt_recordings"
-        VTT_SERVER_LOG="$HOME/vtt_recordings/vtt_server_$(date +%Y%m%d_%H%M%S).log"
-        echo "[vtt] no gnome-terminal; logging server output to $VTT_SERVER_LOG"
-        nohup "$VTT_REPO_DIR/launch_whisper_streaming_server.sh" \
-            >"$VTT_SERVER_LOG" 2>&1 &
-    fi
-    echo "[vtt] waiting for server to bind port..."
-    for waited_seconds in $(seq 1 60); do
-        if nc -z "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
-            echo "[vtt] server up after ${waited_seconds}s"
-            break
-        fi
-        sleep 1
-    done
+    mkdir -p "$HOME/vtt_recordings"
+    VTT_SERVER_LOG="$HOME/vtt_recordings/vtt_server_$(date +%Y%m%d_%H%M%S).log"
+    echo "[vtt] no gnome-terminal; logging server output to $VTT_SERVER_LOG"
+    nohup "$VTT_REPO_DIR/launch_whisper_streaming_server.sh" \
+        >"$VTT_SERVER_LOG" 2>&1 &
 fi
 
+echo "[vtt] waiting for server to bind port $SERVER_PORT..."
+for waited_seconds in $(seq 1 60); do
+    if nc -z "$SERVER_HOST" "$SERVER_PORT" 2>/dev/null; then
+        echo "[vtt] server up after ${waited_seconds}s"
+        break
+    fi
+    sleep 1
+done
+
 # ---- Sticky banner setup ----------------------------------------------
-# Reserve the bottom N rows for the banner. Set the DEC scroll region to
-# rows 1..(LINES - BANNER_HEIGHT) so all subsequent line-output scrolls
-# in the upper region only — the banner at the bottom stays put.
 BANNER_HEIGHT=9
 TERMINAL_TOTAL_LINES="$(tput lines)"
 SCROLL_REGION_BOTTOM_ROW=$((TERMINAL_TOTAL_LINES - BANNER_HEIGHT))
 
-# Clear screen first so we have a clean canvas.
 clear
 
-# Print the banner at the bottom rows.
 print_banner_at_bottom() {
     local banner_first_row=$((TERMINAL_TOTAL_LINES - BANNER_HEIGHT + 1))
     tput cup $((banner_first_row - 1)) 0
@@ -79,11 +83,9 @@ print_banner_at_bottom() {
 }
 print_banner_at_bottom
 
-# Set DEC scroll region: rows 1..SCROLL_REGION_BOTTOM_ROW will scroll;
-# rows below stay frozen. Note ANSI rows are 1-based.
 printf '\033[1;%dr' "$SCROLL_REGION_BOTTOM_ROW"
-# Move cursor to top of scroll region so first output starts there.
 tput cup 0 0
 
-# Run the controller. Disable its own banner (already drawn above).
-VTT_SUPPRESS_BANNER=1 exec python3 "$VTT_REPO_DIR/whisper_streaming_hotkey_controller.py"
+# Run controller in-process (NOT exec) so the bash EXIT trap fires when the
+# controller terminates — that's what kills the server.
+VTT_SUPPRESS_BANNER=1 python3 "$VTT_REPO_DIR/whisper_streaming_hotkey_controller.py"
