@@ -9,7 +9,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"
 SERVER_PORT="${SERVER_PORT:-43007}"
 
-OUTPUT_TRANSCRIPT_FILE="${1:-system_audio_transcript_$(date +%Y%m%d_%H%M%S).txt}"
+DEFAULT_TRANSCRIPT_DIRECTORY="$HOME/vtt_recordings"
+mkdir -p "$DEFAULT_TRANSCRIPT_DIRECTORY"
+OUTPUT_TRANSCRIPT_FILE="${1:-$DEFAULT_TRANSCRIPT_DIRECTORY/system_audio_transcript_$(date +%Y%m%d_%H%M%S).txt}"
 
 DEFAULT_SINK_NAME="$(pactl get-default-sink)"
 PULSE_MONITOR_SOURCE_NAME="${DEFAULT_SINK_NAME}.monitor"
