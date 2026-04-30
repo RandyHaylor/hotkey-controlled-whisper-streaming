@@ -91,9 +91,19 @@ jobs:
         run: choco install -y ffmpeg
         shell: pwsh
 
-      - name: Install AutoHotkey v2 (chocolatey, pinned)
-        run: choco install -y autohotkey --version=2.0.11
+      - name: Install AutoHotkey v2 (direct download)
         shell: pwsh
+        run: |
+          # Chocolatey's "autohotkey" package is v1; v2 isn't packaged under
+          # that name. Download the official v2 portable zip from
+          # autohotkey.com and extract to a known location.
+          $autoHotkeyV2Version = "2.0.18"
+          $downloadUrl = "https://www.autohotkey.com/download/ahk-v2-$autoHotkeyV2Version.zip"
+          $downloadZipPath = "$env:RUNNER_TEMP\ahk-v2.zip"
+          $extractDirectory = "C:\AutoHotkeyV2"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadZipPath
+          Expand-Archive -Path $downloadZipPath -DestinationPath $extractDirectory -Force
+          Get-ChildItem $extractDirectory | Format-Table Name, Length
 
       - name: Install Python dependencies
         run: |
@@ -108,26 +118,24 @@ jobs:
       - name: Validate AutoHotkey script syntax
         shell: pwsh
         run: |
-          $candidates = @(
-            "C:\Program Files\AutoHotkey\v2\AutoHotkey64.exe",
-            "C:\Program Files\AutoHotkey\v2\AutoHotkey32.exe",
-            "C:\Program Files\AutoHotkey\AutoHotkey64.exe",
-            "C:\ProgramData\chocolatey\lib\autohotkey\tools\AutoHotkey64.exe"
+          $candidatePaths = @(
+            "C:\AutoHotkeyV2\AutoHotkey64.exe",
+            "C:\AutoHotkeyV2\AutoHotkey32.exe"
           )
-          $ahk = $null
-          foreach ($c in $candidates) {
-            if (Test-Path $c) { $ahk = $c; break }
+          $autoHotkeyExecutablePath = $null
+          foreach ($candidate in $candidatePaths) {
+            if (Test-Path $candidate) { $autoHotkeyExecutablePath = $candidate; break }
           }
-          if (-not $ahk) {
-            $found = Get-ChildItem -Path "C:\Program Files\AutoHotkey","C:\ProgramData\chocolatey\lib\autohotkey" -Recurse -Filter "AutoHotkey*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) { $ahk = $found.FullName }
+          if (-not $autoHotkeyExecutablePath) {
+            $found = Get-ChildItem -Path "C:\AutoHotkeyV2" -Recurse -Filter "AutoHotkey*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $autoHotkeyExecutablePath = $found.FullName }
           }
-          if (-not $ahk) {
-            Write-Error "AutoHotkey executable not found"
+          if (-not $autoHotkeyExecutablePath) {
+            Write-Error "AutoHotkey executable not found in C:\AutoHotkeyV2"
             exit 1
           }
-          Write-Host "Using AutoHotkey at: $ahk"
-          & $ahk /validate windows\streaming_dictation.ahk
+          Write-Host "Using AutoHotkey at: $autoHotkeyExecutablePath"
+          & $autoHotkeyExecutablePath /validate windows\streaming_dictation.ahk
           if ($LASTEXITCODE -ne 0) {
             Write-Error "AutoHotkey script validation failed (exit $LASTEXITCODE)"
             exit $LASTEXITCODE
