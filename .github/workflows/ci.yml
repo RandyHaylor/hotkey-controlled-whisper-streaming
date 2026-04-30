@@ -137,14 +137,16 @@ jobs:
       - name: Install Ahk2Exe compiler
         shell: pwsh
         run: |
-          # Ahk2Exe is shipped as a separate GitHub release. Pull a known-good version.
-          $ahk2ExeVersion = "1.1.37.02"
-          $downloadUrl = "https://github.com/AutoHotkey/Ahk2Exe/releases/download/v$ahk2ExeVersion/Ahk2Exe$ahk2ExeVersion.zip"
+          # Ahk2Exe is its own GitHub repo with non-standard tag/asset naming
+          # ("Ahk2Exe<VERSION>.zip" + tag "Ahk2Exe<VERSION>"). Use a pinned
+          # known-good release.
+          $ahk2ExeReleaseTag = "Ahk2Exe1.1.37.02a2"
+          $downloadUrl = "https://github.com/AutoHotkey/Ahk2Exe/releases/download/$ahk2ExeReleaseTag/$ahk2ExeReleaseTag.zip"
           $downloadZipPath = "$env:RUNNER_TEMP\ahk2exe.zip"
           $extractDirectory = "C:\Ahk2Exe"
           Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadZipPath -UseBasicParsing
           Expand-Archive -Path $downloadZipPath -DestinationPath $extractDirectory -Force
-          Get-ChildItem $extractDirectory | Format-Table Name, Length
+          Get-ChildItem $extractDirectory -Recurse | Where-Object { -not $_.PSIsContainer } | Format-Table FullName, Length
 
       - name: Build streaming_dictation.exe with Ahk2Exe
         shell: pwsh
