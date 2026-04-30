@@ -3,7 +3,11 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
+
+permissions:
+  contents: write  # needed for release upload step
 
 jobs:
   linux:
@@ -199,3 +203,11 @@ jobs:
         with:
           name: streaming_dictation-windows-exe
           path: windows/streaming_dictation.exe
+
+      - name: Upload streaming_dictation.exe to GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: windows/streaming_dictation.exe
+          fail_on_unmatched_files: true
+          generate_release_notes: true
