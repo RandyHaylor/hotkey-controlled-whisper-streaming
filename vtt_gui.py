@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Cross-platform Tkinter GUI for the whisper_streaming voice-to-text family.
 
@@ -50,6 +51,39 @@ LOCAL_MODELS_PARENT_DIRECTORY = Path(SCRIPT_DIRECTORY) / "models"
 DEFAULT_WHISPER_MODEL_NAME = "base"
 
 HELP_DOCUMENT_PATH = Path(SCRIPT_DIRECTORY) / "HELP.md"
+
+
+def list_available_nvidia_gpu_indices_with_names():
+    """Return [(index_string, label_string), ...] from `nvidia-smi -L`.
+    Empty list if no NVIDIA driver / no GPUs."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+        )
+        if result.returncode != 0:
+            return []
+        gpus_in_order = []
+        for line_text in result.stdout.splitlines():
+            stripped = line_text.strip()
+            # Lines look like: "GPU 0: NVIDIA GeForce RTX 3090 Ti (UUID: ...)"
+            if not stripped.startswith("GPU "):
+                continue
+            try:
+                colon_index = stripped.index(":")
+                index_part = stripped[len("GPU "):colon_index].strip()
+                name_part = stripped[colon_index + 1 :].strip()
+                # Drop the "(UUID: ...)" suffix to keep label short.
+                if "(UUID:" in name_part:
+                    name_part = name_part.split("(UUID:")[0].strip()
+                gpus_in_order.append((index_part, name_part))
+            except ValueError:
+                continue
+        return gpus_in_order
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
 
 
 def is_nvidia_gpu_available_for_whisper():
@@ -158,6 +192,52 @@ def is_server_reachable():
     return is_whisper_streaming_server_process_running()
 
 
+_WINDOWS_SERVER_PROCESS_NAME_SUBSTRINGS = (
+    "whisper_online_server.py",
+    "whisper_streaming_server_runner_with_device_choice.py",
+)
+
+
+def find_whisper_streaming_server_process_ids_on_windows():
+    """Returns a list of PID strings for python processes whose command
+    line includes our server-runner script name. Uses `wmic` because
+    `tasklist` doesn't expose the command line. Empty list if none."""
+    try:
+        result = subprocess.run(
+            [
+                "wmic",
+                "process",
+                "where",
+                "Name='python.exe' or Name='pythonw.exe'",
+                "get",
+                "ProcessId,CommandLine",
+                "/FORMAT:CSV",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        if result.returncode != 0:
+            return []
+        matched_process_ids = []
+        for line in result.stdout.splitlines():
+            line_stripped = line.strip()
+            if not line_stripped or line_stripped.startswith("Node,"):
+                continue
+            if not any(
+                substring in line_stripped
+                for substring in _WINDOWS_SERVER_PROCESS_NAME_SUBSTRINGS
+            ):
+                continue
+            # CSV columns: Node, CommandLine, ProcessId
+            csv_parts = line_stripped.rsplit(",", 1)
+            if len(csv_parts) == 2 and csv_parts[1].strip().isdigit():
+                matched_process_ids.append(csv_parts[1].strip())
+        return matched_process_ids
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+
+
 def is_whisper_streaming_server_process_running():
     """Cross-platform process-name check. Avoids importing psutil.
     Matches either the legacy direct invocation
@@ -166,17 +246,7 @@ def is_whisper_streaming_server_process_running():
     system_name = platform.system()
     try:
         if system_name == "Windows":
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq python.exe"],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            stdout_text = result.stdout
-            return (
-                "whisper_online_server" in stdout_text
-                or "whisper_streaming_server_runner" in stdout_text
-            )
+            return bool(find_whisper_streaming_server_process_ids_on_windows())
         # Linux + macOS — pgrep with a single regex matching either name.
         result = subprocess.run(
             [
@@ -191,6 +261,21 @@ def is_whisper_streaming_server_process_running():
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+
+def kill_whisper_streaming_server_processes_on_windows():
+    """Kill every python process running our server runner script."""
+    process_ids = find_whisper_streaming_server_process_ids_on_windows()
+    for process_id_string in process_ids:
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/PID", process_id_string],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3.0,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
 
 
 def parse_transcript_line(raw_line_text):
@@ -402,7 +487,7 @@ class VttGuiApplication:
     def __init__(self):
         self.tk_root = tk.Tk()
         self.tk_root.title("Voice-to-Text-Type-Tally (vtttt)")
-        self.tk_root.geometry("780x560")
+        self.tk_root.geometry("940x672")
 
         self.server_subprocess_or_none = None
         self.active_mode_runner_or_none = None
@@ -435,19 +520,10 @@ class VttGuiApplication:
     # ---- UI ---------------------------------------------------------------
 
     def _build_widgets(self):
-        # Status bar widget — created here but NOT packed yet. Packed below
-        # the server controls row so it lives directly under the
-        # Start/Stop server buttons rather than at the very top.
+        # Status text variable — the actual Label widget is created later
+        # (inside the status_and_model_row_frame so it shares a row with
+        # the model dropdown).
         self.status_var = tk.StringVar(value="Server: starting...   Mode: idle")
-        self.status_bar_widget = tk.Label(
-            self.tk_root,
-            textvariable=self.status_var,
-            anchor="w",
-            relief=tk.SUNKEN,
-            bd=1,
-            padx=6,
-            pady=3,
-        )
 
         button_frame = tk.Frame(self.tk_root)
         button_frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=6)
@@ -542,40 +618,15 @@ class VttGuiApplication:
             side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
         )
 
-        # ---- Server controls row (directly under the mode buttons) -----
-        server_controls_frame = tk.Frame(self.tk_root)
-        server_controls_frame.pack(
-            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
-        )
-
         self._gpu_is_available = is_nvidia_gpu_available_for_whisper()
+        # Server start/stop buttons are constructed BELOW after the
+        # transcript_controls_frame exists (their parent).
 
-        self.button_start_server_gpu = tk.Button(
-            server_controls_frame,
-            text="Start server (GPU)",
-            command=lambda: self._on_start_server_with_device_clicked("cuda"),
-            state=tk.NORMAL if self._gpu_is_available else tk.DISABLED,
-        )
-        self.button_start_server_gpu.pack(side=tk.LEFT, padx=2)
+        # ---- Row: Model dropdown (alone) -------------------------------
+        model_row_frame = tk.Frame(self.tk_root)
+        model_row_frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4))
 
-        self.button_start_server_cpu = tk.Button(
-            server_controls_frame,
-            text="Start server (CPU)",
-            command=lambda: self._on_start_server_with_device_clicked("cpu"),
-        )
-        self.button_start_server_cpu.pack(side=tk.LEFT, padx=2)
-
-        self.button_stop_server = tk.Button(
-            server_controls_frame,
-            text="Stop server",
-            command=self._on_stop_server_button_clicked,
-        )
-        self.button_stop_server.pack(side=tk.LEFT, padx=2)
-
-        # Model dropdown — display rich descriptive strings, but the
-        # underlying model name is recovered via the display->name map.
         from tkinter import ttk as _tk_ttk_module
-        tk.Label(server_controls_frame, text="  Model:").pack(side=tk.LEFT)
         locally_available_models = list_locally_available_whisper_model_names()
         if not locally_available_models:
             locally_available_models = [DEFAULT_WHISPER_MODEL_NAME]
@@ -663,16 +714,115 @@ class VttGuiApplication:
             len(string) for string in whisper_model_dropdown_display_strings
         )
         self.whisper_model_dropdown = _tk_ttk_module.Combobox(
-            server_controls_frame,
+            model_row_frame,
             textvariable=self.selected_whisper_model_dropdown_display_var,
             values=whisper_model_dropdown_display_strings,
             state="readonly",
-            width=min(widest_display_length, 70),
         )
-        self.whisper_model_dropdown.pack(side=tk.LEFT, padx=(2, 0))
+        # Label on the left, dropdown fills the rest of the row.
+        tk.Label(model_row_frame, text="Model: ").pack(side=tk.LEFT)
+        self.whisper_model_dropdown.pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
         self.whisper_model_dropdown.bind(
             "<<ComboboxSelected>>",
             lambda event: self._on_whisper_model_selection_changed(),
+        )
+
+        # ---- Row: Server controls (GPU/CPU/Stop + GPU index + status) --
+        server_controls_row_frame = tk.Frame(self.tk_root)
+        server_controls_row_frame.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
+        )
+        self.button_start_server_gpu = tk.Button(
+            server_controls_row_frame,
+            text="Start server (GPU)",
+            command=lambda: self._on_start_server_with_device_clicked("cuda"),
+            state=tk.NORMAL if self._gpu_is_available else tk.DISABLED,
+        )
+        self.button_start_server_gpu.pack(side=tk.LEFT, padx=2)
+        self.button_start_server_cpu = tk.Button(
+            server_controls_row_frame,
+            text="Start server (CPU)",
+            command=lambda: self._on_start_server_with_device_clicked("cpu"),
+        )
+        self.button_start_server_cpu.pack(side=tk.LEFT, padx=2)
+        self.button_stop_server = tk.Button(
+            server_controls_row_frame,
+            text="Stop server",
+            command=self._on_stop_server_button_clicked,
+        )
+        self.button_stop_server.pack(side=tk.LEFT, padx=(2, 12))
+
+        # GPU index dropdown — populated from `nvidia-smi -L`. Disabled if
+        # no NVIDIA driver. Selecting an index sets CUDA_VISIBLE_DEVICES
+        # for the next server launch.
+        self.available_gpu_indices_with_names = (
+            list_available_nvidia_gpu_indices_with_names()
+        )
+        gpu_index_dropdown_values = [
+            f"{idx}: {name}"
+            for idx, name in self.available_gpu_indices_with_names
+        ] or ["(no GPU)"]
+        initial_gpu_index_string = (
+            os.environ.get("CUDA_VISIBLE_DEVICES")
+            or (self.available_gpu_indices_with_names[0][0]
+                if self.available_gpu_indices_with_names else "")
+        )
+        initial_gpu_index_display = next(
+            (
+                display_string
+                for display_string in gpu_index_dropdown_values
+                if display_string.startswith(f"{initial_gpu_index_string}:")
+            ),
+            gpu_index_dropdown_values[0],
+        )
+        self.selected_gpu_index_display_var = tk.StringVar(
+            value=initial_gpu_index_display
+        )
+        if self.available_gpu_indices_with_names:
+            os.environ["CUDA_VISIBLE_DEVICES"] = (
+                self.available_gpu_indices_with_names[0][0]
+                if not os.environ.get("CUDA_VISIBLE_DEVICES")
+                else os.environ["CUDA_VISIBLE_DEVICES"]
+            )
+        tk.Label(server_controls_row_frame, text=" GPU index: ").pack(
+            side=tk.LEFT
+        )
+        self.gpu_index_dropdown = _tk_ttk_module.Combobox(
+            server_controls_row_frame,
+            textvariable=self.selected_gpu_index_display_var,
+            values=gpu_index_dropdown_values,
+            state="readonly" if self.available_gpu_indices_with_names else tk.DISABLED,
+            width=max(
+                (len(string) for string in gpu_index_dropdown_values),
+                default=10,
+            ),
+        )
+        self.gpu_index_dropdown.pack(side=tk.LEFT, padx=(0, 12))
+        self.gpu_index_dropdown.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self._on_gpu_index_selection_changed(),
+        )
+
+        # Status bar at the right end of this row.
+        self.status_bar_widget = tk.Label(
+            server_controls_row_frame,
+            textvariable=self.status_var,
+            anchor="w",
+            relief=tk.SUNKEN,
+            bd=1,
+            padx=6,
+            pady=3,
+        )
+        self.status_bar_widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        # ---- Bottom controls row: server start/stop on the left, then
+        # transcript-related buttons on the right side of the same row.
+        # ---- Row: Transcript controls (Open / Clear / Copy / Help) ----
+        transcript_controls_frame = tk.Frame(self.tk_root)
+        transcript_controls_frame.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 6)
         )
 
         # Capture default visual state for GPU / CPU buttons so we can
@@ -690,36 +840,29 @@ class VttGuiApplication:
             )
         }
 
-        # Pack the status bar BELOW the server controls row.
-        self.status_bar_widget.pack(
-            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
-        )
-
-        # ---- Transcript controls row (under the server controls) -------
-        transcript_controls_frame = tk.Frame(self.tk_root)
-        transcript_controls_frame.pack(
-            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 6)
-        )
-        tk.Button(
-            transcript_controls_frame,
-            text="Open transcripts folder",
-            command=lambda: open_folder_in_native_file_manager(TRANSCRIPTS_DIRECTORY),
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Button(
-            transcript_controls_frame,
-            text="Clear",
-            command=self._on_clear_transcript_button_clicked,
-        ).pack(side=tk.LEFT, padx=2)
-        tk.Button(
-            transcript_controls_frame,
-            text="Copy all",
-            command=self._on_copy_all_transcript_button_clicked,
-        ).pack(side=tk.LEFT, padx=2)
+        # Right-justify the row: pack with side=RIGHT in REVERSE visual
+        # order so the on-screen left-to-right order is
+        # Open | Clear | Copy all | Help, all anchored to the right edge.
         tk.Button(
             transcript_controls_frame,
             text="Help",
             command=self._on_help_button_clicked,
-        ).pack(side=tk.LEFT, padx=2)
+        ).pack(side=tk.RIGHT, padx=2)
+        tk.Button(
+            transcript_controls_frame,
+            text="Copy all",
+            command=self._on_copy_all_transcript_button_clicked,
+        ).pack(side=tk.RIGHT, padx=2)
+        tk.Button(
+            transcript_controls_frame,
+            text="Clear",
+            command=self._on_clear_transcript_button_clicked,
+        ).pack(side=tk.RIGHT, padx=2)
+        tk.Button(
+            transcript_controls_frame,
+            text="Open transcripts folder",
+            command=lambda: open_folder_in_native_file_manager(TRANSCRIPTS_DIRECTORY),
+        ).pack(side=tk.RIGHT, padx=(6, 2))
         # No "Quit" button — the window's X close button already triggers
         # _on_window_close via the WM_DELETE_WINDOW protocol binding.
 
@@ -1091,6 +1234,21 @@ class VttGuiApplication:
         self._append_log_text("[server] starting...\n")
         self._start_server_async()
 
+    def _on_gpu_index_selection_changed(self):
+        """User picked a GPU from the GPU-index dropdown. Set the
+        CUDA_VISIBLE_DEVICES env var so the next server launch targets
+        that GPU. (Doesn't auto-restart — user clicks 'Start server (GPU)'
+        to apply.)"""
+        selected_display = self.selected_gpu_index_display_var.get()
+        if ":" not in selected_display:
+            return
+        gpu_index_string = selected_display.split(":", 1)[0].strip()
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_index_string
+        self._append_log_text(
+            f"[gpu] CUDA_VISIBLE_DEVICES set to {gpu_index_string} — "
+            f"click 'Start server (GPU)' to apply.\n"
+        )
+
     def _on_start_server_with_device_clicked(self, device_name):
         """Stop any running server and (re)start it using the selected
         compute device ("cuda" or "cpu"). Sets WHISPER_DEVICE env var so
@@ -1122,11 +1280,7 @@ class VttGuiApplication:
         self._append_log_text("[server] stopping...\n")
         try:
             if platform.system() == "Windows":
-                subprocess.run(
-                    ["taskkill", "/F", "/IM", "whisper_online_server.py"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                kill_whisper_streaming_server_processes_on_windows()
             else:
                 subprocess.run(
                     [
@@ -1286,11 +1440,7 @@ class VttGuiApplication:
         # executable name.
         try:
             if platform.system() == "Windows":
-                subprocess.run(
-                    ["taskkill", "/F", "/IM", "whisper_online_server.py"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                kill_whisper_streaming_server_processes_on_windows()
             else:
                 subprocess.run(
                     [
@@ -1301,7 +1451,7 @@ class VttGuiApplication:
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-            # Also close the gnome-terminal window if it's still up.
+            # Also close the gnome-terminal window if it's still up (Linux).
             if shutil.which("wmctrl"):
                 subprocess.run(
                     ["wmctrl", "-c", "vtt-server"],
