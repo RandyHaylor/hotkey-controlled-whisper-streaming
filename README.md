@@ -134,9 +134,24 @@ server (CPU)" button is enabled by default on Macs).
    On the first installer screen, **check "Add python.exe to PATH"**.
 
 2. Install **ffmpeg** — pick one:
-   - `winget install Gyan.FFmpeg`
-   - or download a build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)
-     and add the `bin` folder to your PATH
+   - `winget install Gyan.FFmpeg` (handles PATH automatically)
+   - or download the **"essentials"** build from
+     [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) (the full build is
+     not needed; essentials includes DirectShow). Extract to e.g.
+     `C:\ffmpeg\` and add `C:\ffmpeg\bin` to your user PATH:
+
+     ```powershell
+     [Environment]::SetEnvironmentVariable("Path", `
+         [Environment]::GetEnvironmentVariable("Path","User") + ";C:\ffmpeg\bin", `
+         "User")
+     ```
+
+     Or via GUI: press Win, type "Edit environment variables for your
+     account", select **Path** → **New** → enter `C:\ffmpeg\bin`.
+
+   **Important:** close and reopen any terminals (and the GUI, if it was
+   already running) after the PATH change — existing processes inherit
+   the old environment. Verify with `ffmpeg -version` in a fresh shell.
 
 3. Clone (Git for Windows):
 
@@ -165,9 +180,18 @@ server (CPU)" button is enabled by default on Macs).
    launchers\install_windows_desktop_shortcut.bat
    ```
 
-System-audio capture on Windows uses WASAPI loopback (handled by ffmpeg).
-Older ffmpeg builds may lack `wasapi loopback`; in that case, enable
-"Stereo Mix" in Sound settings as a fallback, or install a recent ffmpeg.
+**System-audio capture on Windows.** Most Windows ffmpeg builds (including
+gyan.dev essentials) ship only DirectShow as an input device, **not**
+WASAPI loopback. To capture what your speakers are playing, enable the
+legacy **Stereo Mix** input:
+
+1. Right-click the speaker icon → *Sound settings* → *Sound Control Panel*.
+2. *Recording* tab → right-click empty area → *Show Disabled Devices*.
+3. Right-click *Stereo Mix* → *Enable*.
+
+Not all sound drivers expose Stereo Mix. If yours doesn't, install a
+virtual audio cable (e.g. VB-Audio Cable) and route system output through
+it. Mic capture works out of the box via DirectShow with no extra setup.
 
 ## Models
 
