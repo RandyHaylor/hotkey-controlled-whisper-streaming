@@ -178,12 +178,40 @@ hint to read Help; selecting an installed entry stops/restarts the
 server with the new model.
 
 Models bundled in this repo (via Git LFS): `tiny`, `tiny.en`, `base`,
-`base.en`. Larger models (`small` upward) are not committed. To add
-more, drop a faster-whisper / CTranslate2 model directory into
-`<repo>/models/<size>/` so it contains `model.bin`, `config.json`,
-`tokenizer.json`, `vocabulary.txt`. Sources include the
+`base.en` (Whisper, multilingual + English-only) and
+`moonshine-tiny-streaming`, `moonshine-small-streaming` (Moonshine
+streaming, English-only, CPU real-time). Larger Whisper models (`small`
+upward) are not committed. To add more Whisper sizes, drop a
+faster-whisper / CTranslate2 model directory into `<repo>/models/<size>/`
+so it contains `model.bin`, `config.json`, `tokenizer.json`,
+`vocabulary.txt`. Sources include the
 [`Systran/faster-whisper-*`](https://huggingface.co/Systran) repos on
 Hugging Face Hub. See `HELP.md` for one-liner download commands.
+
+### Moonshine vs Whisper
+
+Moonshine (`moonshine-tiny-streaming`, `moonshine-small-streaming`) is an
+alternative ASR engine built for very low-latency, CPU real-time
+transcription. It uses Moonshine's **own official streaming engine** (the
+[`moonshine-voice`](https://pypi.org/project/moonshine-voice/) package,
+Moonshine v2 streaming models) — a separate, self-contained server with
+its own bundled CPU ONNX runtime. It does **not** share Whisper's
+`whisper_streaming` pipeline; selecting a Moonshine model just starts a
+different server on the same port and wire protocol.
+
+Moonshine is **English-only and CPU-only** here (fast CPU inference is its
+whole point — ~8x faster than real-time, ~65-90 ms per finalized line on a
+typical CPU). Text commits at speech-endpoint (phrase) granularity:
+Moonshine finalizes a line when you pause, and that line is typed/logged.
+
+To (re)download the Moonshine streaming weights into `<repo>/models/`:
+
+```bash
+pip install moonshine-voice
+python3 download_moonshine_models_to_local_models_directory.py
+# or just one size:
+python3 download_moonshine_models_to_local_models_directory.py tiny
+```
 
 ## GUI quick reference
 

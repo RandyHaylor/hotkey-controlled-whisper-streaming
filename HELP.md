@@ -87,6 +87,96 @@ python3 -c "from huggingface_hub import snapshot_download; snapshot_download(rep
 But again — the app itself does NO downloading. That's a deliberate
 design choice so the runtime is fully offline.
 
+### Moonshine streaming models (alternative engine)
+
+`moonshine-tiny-streaming` and `moonshine-small-streaming` are listed in
+the same dropdown. They use Moonshine's own official streaming engine
+(the `moonshine-voice` package) and a different file layout than Whisper:
+
+```
+models/moonshine-<size>-streaming/
+  ├── encoder.ort
+  ├── decoder_kv.ort
+  ├── cross_kv.ort
+  ├── adapter.ort
+  ├── frontend.ort
+  ├── streaming_config.json
+  └── tokenizer.bin
+```
+
+The included helper downloads both variants into the right places:
+
+```bash
+pip install moonshine-voice
+python3 download_moonshine_models_to_local_models_directory.py
+# or just one:
+python3 download_moonshine_models_to_local_models_directory.py tiny
+```
+
+Selecting a Moonshine entry restarts the server with the standalone
+Moonshine streaming server instead of the Whisper one — same TCP protocol
+on 127.0.0.1:43007 (so typing/logging is unchanged), but a completely
+separate ASR engine. Moonshine here is **English-only and CPU-only**
+(fast CPU inference is the point). Unlike Whisper's word-by-word commits,
+Moonshine commits a line when you pause (speech endpoint), then types it.
+
+`tiny-streaming` is the smallest streaming model available (≈34M params);
+there is no smaller streaming variant.
+
+### Moonshine settings panel
+
+A row labeled **"Moonshine (apply on server restart)"** exposes the
+official Moonshine tuning options. These help when slow/halting speech
+produces hallucinated text:
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| Max tokens/sec | 6.5 | Hallucination cap — lower suppresses garbage during near-silence |
+| VAD window (s) | 0.5 | Higher smooths over short thinking-pauses |
+| VAD threshold | 0.5 | Lower = longer segments / more pause-tolerant (more background noise) |
+| Max segment (s) | 15 | Longest a line grows before it's force-completed |
+
+Every field has a **hover tooltip** with a plain-English explanation and
+when to raise/lower it. A **"Restore defaults"** button (with a
+confirmation prompt) resets all Moonshine settings.
+
+Changes are **saved immediately** (persisted to your settings file) but
+only take effect when the server next restarts — the panel shows
+"⚠ changed — applies on next server restart" until you restart it (click
+Start server, or switch model/device). Settings persist across launches.
+
+### Whisper settings panel
+
+A row labeled **"Whisper (apply on server restart)"** exposes the relevant
+whisper_streaming tunables (these affect the Whisper engine only):
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| Min chunk (s) | 0.5 | Min audio per processing step — lower = lower latency, higher = waits longer before committing |
+| Buffer trim (s) | 8 | How long the rolling buffer grows before trimming |
+| Trim mode | segment | Trim at completed segments or sentences |
+| Voice Activity Detection (VAD) | on | Skip silent gaps so they aren't transcribed (reduces silence-hallucinations) |
+| Voice Activity Controller (VAC) | off | Only feed the recognizer once speech is detected (Silero) — **requires torch** |
+
+Every field has a **hover tooltip** with a plain-English explanation and
+when to raise/lower it. A **"Restore defaults"** button (with a
+confirmation prompt) resets all Whisper settings.
+
+Like the Moonshine panel: changes save immediately but apply on the next
+server restart, and the "⚠ changed" notice only appears when a **Whisper**
+model is the loaded engine (changing Whisper settings while Moonshine is
+running shows no notice, since it wouldn't affect the running server — and
+vice versa).
+
+Note: when a Moonshine model is selected, the **CPU** server button is
+highlighted, because Moonshine always runs on CPU regardless of the GPU/CPU
+choice (which only applies to Whisper).
+
+### Right-click in the transcript
+
+Right-click (macOS: Control-click) in the transcript, log, or help panes
+for a Cut / Copy / Paste / Select All menu.
+
 ## Where transcripts are saved
 
 `~/vtt_recordings/` (created automatically). Click **Open transcripts

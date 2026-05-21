@@ -16,5 +16,7 @@ venv/
 !/models/tiny.en/
 !/models/base/
 !/models/base.en/
+!/models/moonshine-tiny-streaming/
+!/models/moonshine-small-streaming/
 # Transcript output dir (per-user, auto-created).
 /vtt_recordings/
