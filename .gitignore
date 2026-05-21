@@ -20,3 +20,6 @@ venv/
 !/models/moonshine-small-streaming/
 # Transcript output dir (per-user, auto-created).
 /vtt_recordings/
+# sherpa-onnx scratch sandbox: a full upstream clone + large model tarballs.
+# The POC scripts are preserved (tracked) under sherpa_poc/ instead.
+/sherpa-test/
