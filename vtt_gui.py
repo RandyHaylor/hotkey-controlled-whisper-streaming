@@ -236,18 +236,27 @@ FASTER_WHISPER_MODEL_INSTALLED_MARKER_FILENAME = "model.bin"
 # Moonshine streaming models (moonshine-voice) ship a streaming_config.json
 # alongside their .ort components; this file is unique to that model family.
 MOONSHINE_STREAMING_MODEL_INSTALLED_MARKER_FILENAME = "streaming_config.json"
+# sherpa-onnx streaming Zipformer model dirs ship a tokens.txt (unique here —
+# Whisper uses tokenizer.json, Moonshine uses tokenizer.bin).
+SHERPA_MODEL_INSTALLED_MARKER_FILENAME = "tokens.txt"
+# The sherpa punctuation/truecasing model lives in its own companion dir; it is
+# NOT a selectable model, so exclude it from discovery.
+SHERPA_PUNCTUATION_MODEL_DIRECTORY_NAME = "sherpa-online-punct-en"
 
 
 def is_directory_an_installed_local_model_directory(candidate_directory):
-    """A model directory counts as 'installed' if it contains either:
-      - a faster-whisper / CTranslate2 `model.bin` (Whisper), OR
-      - a `streaming_config.json` (Moonshine streaming model, moonshine-voice).
-    """
+    """A model directory counts as 'installed' if it contains a recognized
+    marker: faster-whisper `model.bin`, Moonshine `streaming_config.json`, or
+    sherpa `tokens.txt`. The sherpa punctuation companion dir is excluded."""
     if not candidate_directory.is_dir():
+        return False
+    if candidate_directory.name == SHERPA_PUNCTUATION_MODEL_DIRECTORY_NAME:
         return False
     if (candidate_directory / FASTER_WHISPER_MODEL_INSTALLED_MARKER_FILENAME).is_file():
         return True
     if (candidate_directory / MOONSHINE_STREAMING_MODEL_INSTALLED_MARKER_FILENAME).is_file():
+        return True
+    if (candidate_directory / SHERPA_MODEL_INSTALLED_MARKER_FILENAME).is_file():
         return True
     return False
 
@@ -275,6 +284,12 @@ def is_moonshine_model_name(model_name):
     (handled by moonshine_streaming_server_runner_with_device_choice.py)
     rather than a faster-whisper model."""
     return str(model_name).startswith("moonshine-")
+
+
+def is_sherpa_model_name(model_name):
+    """Return True if the model name refers to a sherpa-onnx streaming model
+    (handled by sherpa_streaming_server.py). CPU-only, its own module."""
+    return str(model_name).startswith("sherpa-")
 
 LINUX_SERVER_LAUNCHER_PATH = os.path.join(
     SCRIPT_DIRECTORY, "launch_whisper_streaming_server.sh"
@@ -362,6 +377,7 @@ ALL_STREAMING_SERVER_PROCESS_SCRIPT_NAMES = (
     "whisper_online_server.py",
     "whisper_streaming_server_runner_with_device_choice.py",
     "moonshine_streaming_server.py",
+    "sherpa_streaming_server.py",
 )
 
 # pgrep/pkill -f take an extended regex; '.' is a regex metachar so escape
@@ -868,6 +884,7 @@ class VttGuiApplication:
             "large":     "large     — ~3.0 GB · multilingual · alias for the latest large model",
             "moonshine-tiny-streaming": "moonshine-tiny-streaming — ~80 MB · English-only · CPU real-time streaming (fastest)",
             "moonshine-small-streaming": "moonshine-small-streaming — ~235 MB · English-only · CPU real-time streaming (more accurate)",
+            "sherpa-zipformer-en-20m": "sherpa-zipformer-en-20m — ~50 MB · English-only · CPU streaming + punctuation/truecasing",
         }
 
         # Track which models are actually present on disk so the
@@ -1272,19 +1289,27 @@ class VttGuiApplication:
             os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL_NAME)
         )
 
+    def _current_selected_model_is_cpu_only_engine(self):
+        """Moonshine and sherpa are CPU-only engines (bundled ONNX runtimes);
+        only Whisper honors the GPU/CPU device choice."""
+        current_model = os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL_NAME)
+        return is_moonshine_model_name(current_model) or is_sherpa_model_name(
+            current_model
+        )
+
     def _effective_device_for_current_model(self):
-        """Device the *running* engine actually uses: Moonshine is CPU-only
-        (its bundled runtime), so report CPU regardless of the saved Whisper
-        device preference. Whisper uses the chosen WHISPER_DEVICE."""
-        if self._current_selected_model_is_moonshine():
+        """Device the *running* engine actually uses: Moonshine/sherpa are
+        CPU-only, so report CPU regardless of the saved Whisper device
+        preference. Whisper uses the chosen WHISPER_DEVICE."""
+        if self._current_selected_model_is_cpu_only_engine():
             return "cpu"
         return os.environ.get("WHISPER_DEVICE", "cuda")
 
     def _update_device_buttons_for_selected_model(self):
         """Enable/disable the GPU start button based on the selected model.
-        Moonshine is CPU-only, so its GPU button is disabled; for Whisper the
-        GPU button follows GPU availability. The CPU button is always usable."""
-        if self._current_selected_model_is_moonshine():
+        CPU-only engines (Moonshine/sherpa) disable the GPU button; for Whisper
+        it follows GPU availability. The CPU button is always usable."""
+        if self._current_selected_model_is_cpu_only_engine():
             self.button_start_server_gpu.config(state=tk.DISABLED)
         else:
             self.button_start_server_gpu.config(
@@ -1834,6 +1859,8 @@ class VttGuiApplication:
             LOCAL_MODELS_PARENT_DIRECTORY / whisper_model_name
         )
 
+        if is_sherpa_model_name(whisper_model_name):
+            return self._build_sherpa_server_command_argv(local_model_directory)
         if is_moonshine_model_name(whisper_model_name):
             return self._build_moonshine_server_command_argv(
                 whisper_model_name, local_model_directory
@@ -1841,6 +1868,45 @@ class VttGuiApplication:
         return self._build_whisper_server_command_argv(
             whisper_model_name, local_model_directory
         )
+
+    def _build_sherpa_server_command_argv(self, local_model_directory):
+        """sherpa-onnx is its own CPU-only module. Launch its standalone server
+        with the ASR model dir + the punctuation companion dir, and the user's
+        persisted mode (streaming on by default) + stable-prefix tunables."""
+        sherpa_server_script_path = os.path.join(
+            SCRIPT_DIRECTORY, "sherpa_streaming_server.py"
+        )
+        punctuation_model_directory = (
+            LOCAL_MODELS_PARENT_DIRECTORY / SHERPA_PUNCTUATION_MODEL_DIRECTORY_NAME
+        )
+        streaming_mode_enabled = (
+            user_settings_persistence.read_persisted_bool_or_default(
+                "sherpa_streaming_mode", True
+            )
+        )
+        mode = "streaming" if streaming_mode_enabled else "whole_sentence"
+        context_window_words = user_settings_persistence.read_persisted_float_or_default(
+            "sherpa_context_window_words", 32
+        )
+        mutable_suffix_words = user_settings_persistence.read_persisted_float_or_default(
+            "sherpa_mutable_suffix_words", 4
+        )
+        stability_delay_words = user_settings_persistence.read_persisted_float_or_default(
+            "sherpa_stability_delay_words", 3
+        )
+        return [
+            sys.executable,
+            sherpa_server_script_path,
+            "--host", SERVER_HOST,
+            "--port", str(SERVER_PORT),
+            "--model_dir", str(local_model_directory),
+            "--punct_dir", str(punctuation_model_directory),
+            "--mode", mode,
+            "--context-window-words", str(int(context_window_words)),
+            "--mutable-suffix-words", str(int(mutable_suffix_words)),
+            "--stability-delay-words", str(int(stability_delay_words)),
+            "-l", "INFO",
+        ]
 
     def _build_whisper_server_command_argv(
         self, whisper_model_name, local_model_directory

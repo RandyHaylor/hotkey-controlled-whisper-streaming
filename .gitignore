@@ -18,6 +18,8 @@ venv/
 !/models/base.en/
 !/models/moonshine-tiny-streaming/
 !/models/moonshine-small-streaming/
+!/models/sherpa-zipformer-en-20m/
+!/models/sherpa-online-punct-en/
 # Transcript output dir (per-user, auto-created).
 /vtt_recordings/
 # sherpa-onnx scratch sandbox: a full upstream clone + large model tarballs.

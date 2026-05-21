@@ -4,3 +4,5 @@ models/tiny/model.bin filter=lfs diff=lfs merge=lfs -text
 models/tiny.en/model.bin filter=lfs diff=lfs merge=lfs -text
 models/moonshine-tiny-streaming/*.ort filter=lfs diff=lfs merge=lfs -text
 models/moonshine-small-streaming/*.ort filter=lfs diff=lfs merge=lfs -text
+models/sherpa-zipformer-en-20m/*.onnx filter=lfs diff=lfs merge=lfs -text
+models/sherpa-online-punct-en/*.onnx filter=lfs diff=lfs merge=lfs -text

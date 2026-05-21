@@ -85,12 +85,25 @@ python vtt_gui.py
 - **Bundled via Git LFS:**
   - Whisper: `tiny`, `tiny.en`, `base`, `base.en`
   - Moonshine: `moonshine-tiny-streaming` (~80 MB), `moonshine-small-streaming` (~235 MB)
+  - sherpa: `sherpa-zipformer-en-20m` (~50 MB incl. punctuation model) — CPU streaming + punctuation/truecasing, its own module
 - **Add more Whisper sizes** — drop a faster-whisper/CTranslate2 dir (`model.bin`, `config.json`, `tokenizer.json`, `vocabulary.txt`) into `models/<size>/`. Source: [`Systran/faster-whisper-*`](https://huggingface.co/Systran). One-liners in `HELP.md`.
 - **(Re)download Moonshine weights:**
   ```bash
   pip install moonshine-voice
   python3 download_moonshine_models_to_local_models_directory.py   # add `tiny` or `small` for one
   ```
+- **(Re)download sherpa weights:**
+  ```bash
+  pip install sherpa-onnx
+  python3 download_sherpa_models_to_local_models_directory.py
+  ```
+
+### sherpa engine
+
+`sherpa-zipformer-en-20m` is a separate, CPU-only streaming engine
+(sherpa-onnx) with two output modes (streaming rolling-window, default; or
+whole-sentence punctuated). It does **not** share the Whisper/Moonshine
+pipelines. Its live partials show in the server console window.
 
 ## GUI reference
 

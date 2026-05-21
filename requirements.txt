@@ -1,5 +1,6 @@
 faster-whisper
 moonshine-voice
+sherpa-onnx
 sounddevice
 librosa
 soundfile
