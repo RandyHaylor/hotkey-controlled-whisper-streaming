@@ -99,3 +99,63 @@ def test_default_settings_path_is_in_home_directory():
     assert settings_module.USER_SETTINGS_FILE_PATH == (
         Path.home() / ".voice-to-text-type-tally" / "settings.json"
     )
+
+
+# ---- Per-model settings -----------------------------------------------------
+
+def test_per_model_settings_are_namespaced_by_model(tmp_path):
+    p = tmp_path / "settings.json"
+    settings_module.persist_model_setting("base.en", "whisper_min_chunk_size", 0.7, p)
+    settings_module.persist_model_setting("tiny.en", "whisper_min_chunk_size", 0.3, p)
+    # Each model keeps its own value; other model unaffected.
+    assert settings_module.read_model_float_or_default("base.en", "whisper_min_chunk_size", 0.5, p) == 0.7
+    assert settings_module.read_model_float_or_default("tiny.en", "whisper_min_chunk_size", 0.5, p) == 0.3
+    # Unknown model -> default.
+    assert settings_module.read_model_float_or_default("small", "whisper_min_chunk_size", 0.5, p) == 0.5
+
+
+def test_per_model_bool_and_string_round_trip(tmp_path):
+    p = tmp_path / "settings.json"
+    settings_module.persist_model_setting("sherpa-zipformer-en-20m", "sherpa_streaming_mode", False, p)
+    assert settings_module.read_model_bool_or_default("sherpa-zipformer-en-20m", "sherpa_streaming_mode", True, p) is False
+    settings_module.persist_model_setting("base.en", "whisper_buffer_trimming", "sentence", p)
+    assert settings_module.read_model_string_or_default("base.en", "whisper_buffer_trimming", "segment", ("segment","sentence"), p) == "sentence"
+
+
+def test_clear_model_settings_reverts_to_defaults(tmp_path):
+    p = tmp_path / "settings.json"
+    settings_module.persist_model_setting("base.en", "whisper_min_chunk_size", 0.9, p)
+    settings_module.clear_model_settings("base.en", p)
+    assert settings_module.read_model_float_or_default("base.en", "whisper_min_chunk_size", 0.5, p) == 0.5
+
+
+def test_global_device_model_stay_flat_alongside_per_model(tmp_path):
+    p = tmp_path / "settings.json"
+    settings_module.persist_whisper_device_selection("cpu", p)
+    settings_module.persist_whisper_model_selection("base.en", p)
+    settings_module.persist_model_setting("base.en", "whisper_min_chunk_size", 0.6, p)
+    assert settings_module.read_persisted_whisper_device_or_none(p) == "cpu"
+    assert settings_module.read_persisted_whisper_model_or_none(p) == "base.en"
+    assert settings_module.read_model_float_or_default("base.en", "whisper_min_chunk_size", 0.5, p) == 0.6
+
+
+def test_migration_moves_flat_tunables_under_current_model(tmp_path):
+    p = tmp_path / "settings.json"
+    # Simulate a pre-migration flat file.
+    settings_module.write_persisted_user_settings({
+        "whisper_device": "cuda",
+        "whisper_model": "base.en",
+        "whisper_min_chunk_size": 0.7,
+        "moonshine_vad_threshold": 0.4,
+    }, p)
+    settings_module.migrate_flat_settings_to_per_model(p)
+    # Flat tunables moved under models[current model]; globals stay flat.
+    after = settings_module.read_persisted_user_settings(p)
+    assert "whisper_min_chunk_size" not in after
+    assert after["whisper_device"] == "cuda"
+    assert after["models"]["base.en"]["whisper_min_chunk_size"] == 0.7
+    assert after["models"]["base.en"]["moonshine_vad_threshold"] == 0.4
+    # Idempotent: running again is a no-op.
+    settings_module.migrate_flat_settings_to_per_model(p)
+    again = settings_module.read_persisted_user_settings(p)
+    assert again["models"]["base.en"]["whisper_min_chunk_size"] == 0.7

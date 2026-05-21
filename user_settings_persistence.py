@@ -213,3 +213,134 @@ def persist_string_setting(
     settings_file_path: Path = USER_SETTINGS_FILE_PATH,
 ) -> None:
     update_persisted_user_settings(settings_file_path, **{setting_key: str(value)})
+
+
+# ---- Per-MODEL settings -----------------------------------------------------
+#
+# Tunable options are stored per specific model name (not per engine type) under
+# a nested "models" block:
+#
+#   { "whisper_device": "cuda", "whisper_model": "base.en",
+#     "models": { "base.en": {"whisper_min_chunk_size": 0.5, ...},
+#                 "sherpa-zipformer-en-20m": {"sherpa_streaming_mode": true, ...} } }
+#
+# whisper_device / whisper_model stay flat at the top level (they're global).
+
+PER_MODEL_SETTINGS_BLOCK_KEY = "models"
+
+
+def _coerce_float_or_default(raw_value, default_value):
+    try:
+        parsed = float(raw_value)
+    except (TypeError, ValueError):
+        return default_value
+    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+        return default_value
+    return parsed
+
+
+def read_model_settings_dict(
+    model_name: str,
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> dict:
+    """Return the stored settings dict for one specific model (or {})."""
+    models_block = read_persisted_user_settings(settings_file_path).get(
+        PER_MODEL_SETTINGS_BLOCK_KEY, {}
+    )
+    model_settings = models_block.get(model_name) if isinstance(models_block, dict) else None
+    return model_settings if isinstance(model_settings, dict) else {}
+
+
+def read_model_float_or_default(
+    model_name: str, setting_key: str, default_value: float,
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> float:
+    return _coerce_float_or_default(
+        read_model_settings_dict(model_name, settings_file_path).get(setting_key),
+        default_value,
+    )
+
+
+def read_model_bool_or_default(
+    model_name: str, setting_key: str, default_value: bool,
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> bool:
+    raw_value = read_model_settings_dict(model_name, settings_file_path).get(setting_key)
+    return raw_value if isinstance(raw_value, bool) else default_value
+
+
+def read_model_string_or_default(
+    model_name: str, setting_key: str, default_value: str, allowed_values=None,
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> str:
+    raw_value = read_model_settings_dict(model_name, settings_file_path).get(setting_key)
+    if not isinstance(raw_value, str):
+        return default_value
+    if allowed_values is not None and raw_value not in allowed_values:
+        return default_value
+    return raw_value
+
+
+def persist_model_setting(
+    model_name: str, setting_key: str, value,
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> None:
+    """Set one setting for one specific model, atomically."""
+    settings = read_persisted_user_settings(settings_file_path)
+    models_block = settings.get(PER_MODEL_SETTINGS_BLOCK_KEY)
+    if not isinstance(models_block, dict):
+        models_block = {}
+    model_settings = models_block.get(model_name)
+    if not isinstance(model_settings, dict):
+        model_settings = {}
+    model_settings[setting_key] = value
+    models_block[model_name] = model_settings
+    settings[PER_MODEL_SETTINGS_BLOCK_KEY] = models_block
+    write_persisted_user_settings(settings, settings_file_path)
+
+
+def clear_model_settings(
+    model_name: str,
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> None:
+    """Remove all stored overrides for one model (so its defaults apply)."""
+    settings = read_persisted_user_settings(settings_file_path)
+    models_block = settings.get(PER_MODEL_SETTINGS_BLOCK_KEY)
+    if isinstance(models_block, dict) and model_name in models_block:
+        del models_block[model_name]
+        settings[PER_MODEL_SETTINGS_BLOCK_KEY] = models_block
+        write_persisted_user_settings(settings, settings_file_path)
+
+
+def migrate_flat_settings_to_per_model(
+    settings_file_path: Path = USER_SETTINGS_FILE_PATH,
+) -> None:
+    """One-time, idempotent, non-destructive migration: move legacy flat
+    tunable keys (whisper_/moonshine_/sherpa_*, excluding whisper_device and
+    whisper_model) under models[<current whisper_model>]. Runs once (guarded on
+    the presence of the 'models' block); never raises."""
+    try:
+        settings = read_persisted_user_settings(settings_file_path)
+        if PER_MODEL_SETTINGS_BLOCK_KEY in settings:
+            return  # already migrated
+        current_model = settings.get(WHISPER_MODEL_SETTING_KEY)
+        flat_tunable_keys = [
+            key for key in list(settings.keys())
+            if key not in (WHISPER_DEVICE_SETTING_KEY, WHISPER_MODEL_SETTING_KEY)
+            and (
+                key.startswith("whisper_")
+                or key.startswith("moonshine_")
+                or key.startswith("sherpa_")
+            )
+        ]
+        models_block = {}
+        if current_model and flat_tunable_keys:
+            models_block[current_model] = {
+                key: settings[key] for key in flat_tunable_keys
+            }
+            for key in flat_tunable_keys:
+                del settings[key]
+        settings[PER_MODEL_SETTINGS_BLOCK_KEY] = models_block
+        write_persisted_user_settings(settings, settings_file_path)
+    except Exception:
+        pass
