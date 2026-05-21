@@ -31,6 +31,13 @@ def preload_pip_installed_nvidia_shared_libraries_for_gpu_mode():
     libcudnn_ops.so". We preload all libcudnn*/libcublas* with RTLD_GLOBAL
     so subsequent dlopens by CTranslate2 resolve. CPU mode doesn't need
     this — skip the work.
+
+    IMPORTANT: we must NOT preload libnvblas. The nvidia-cublas wheel ships
+    libnvblas.so (NVIDIA's drop-in BLAS interposer). Loading it RTLD_GLOBAL
+    interposes CPU BLAS symbols (sgemm, …) process-wide; torch (used only on
+    the VAC / Silero VAD path) then makes CPU BLAS calls that route into
+    NVBLAS, which has no CPU BLAS provider configured -> segfault. CTranslate2
+    only needs cuDNN + cuBLAS/cuBLASLt, never NVBLAS, so we skip it.
     """
     if os.environ.get("WHISPER_DEVICE", "cuda").strip().lower() == "cpu":
         return
@@ -49,6 +56,9 @@ def preload_pip_installed_nvidia_shared_libraries_for_gpu_mode():
         for shared_object_path in sorted(
             glob.glob(os.path.join(nvidia_lib_dir, "lib*.so*"))
         ):
+            # Skip the NVBLAS interposer — it breaks torch's CPU BLAS (VAC).
+            if os.path.basename(shared_object_path).startswith("libnvblas"):
+                continue
             try:
                 ctypes.CDLL(shared_object_path, mode=ctypes.RTLD_GLOBAL)
             except OSError:

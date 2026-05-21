@@ -676,10 +676,16 @@ class VttGuiApplication:
         except Exception:
             self._loopback_available = False
 
+        # Right-click context menus get registered here so we can dismiss them
+        # all when the application window loses focus.
+        self._context_menus = []
+
         self._build_widgets()
         self.tk_root.protocol("WM_DELETE_WINDOW", self._on_window_close)
         # Any left-click commits the numeric setting fields (see handler).
         self.tk_root.bind("<Button-1>", self._on_global_left_click, add="+")
+        # When the whole app loses focus, dismiss any open context menu.
+        self.tk_root.bind("<FocusOut>", self._on_app_focus_out, add="+")
 
         TRANSCRIPTS_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
@@ -1676,6 +1682,25 @@ class VttGuiApplication:
         if hasattr(self, "moonshine_settings_restart_notice_var"):
             self.moonshine_settings_restart_notice_var.set("")
 
+    def _on_app_focus_out(self, event):
+        """When the application window loses focus, dismiss any posted
+        right-click context menu. We defer one tick and check focus_get(): it
+        returns None only when no widget in this app holds focus (i.e. the
+        whole app lost focus), so internal widget-to-widget focus changes
+        don't trigger a dismiss."""
+        def dismiss_menus_if_app_unfocused():
+            try:
+                app_has_focus = self.tk_root.focus_get() is not None
+            except Exception:
+                app_has_focus = True
+            if not app_has_focus:
+                for context_menu in self._context_menus:
+                    try:
+                        context_menu.unpost()
+                    except Exception:
+                        pass
+        self.tk_root.after(1, dismiss_menus_if_app_unfocused)
+
     def _on_global_left_click(self, event):
         """Any left-click anywhere in the window commits the numeric setting
         fields, so clicking away after typing applies the value (and shows the
@@ -1709,6 +1734,7 @@ class VttGuiApplication:
         tk Text widgets have no default context menu, which is why right-click
         otherwise appears to do nothing."""
         context_menu = tk.Menu(text_widget, tearoff=0)
+        self._context_menus.append(context_menu)
         if include_editing_actions:
             context_menu.add_command(
                 label="Cut",
