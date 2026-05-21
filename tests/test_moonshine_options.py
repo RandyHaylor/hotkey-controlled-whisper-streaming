@@ -29,6 +29,33 @@ def test_tunable_option_specs_cover_expected_options():
     }
 
 
+def test_stable_prefix_streaming_holds_back_two_words_then_flushes():
+    # Simulate a line growing word-by-word; held_back=2 means we emit only
+    # once a word is at least 2 from the end, and flush the tail on finalize.
+    emit = backend.compute_stable_prefix_words_to_emit
+    emitted = 0
+
+    words, emitted = emit("And".split(), emitted, False, 2)
+    assert words == []                       # 1 word, none stable yet
+    words, emitted = emit("And so".split(), emitted, False, 2)
+    assert words == []                       # 2 words, still held back
+    words, emitted = emit("And so my".split(), emitted, False, 2)
+    assert words == ["And"]                  # "And" now stable
+    words, emitted = emit("And so my fellow".split(), emitted, False, 2)
+    assert words == ["so"]
+    # Finalize: flush everything remaining (the held-back tail).
+    words, emitted = emit("And so my fellow".split(), emitted, True, 2)
+    assert words == ["my", "fellow"]
+    assert emitted == 4
+
+
+def test_stable_prefix_finalize_short_line_emits_all():
+    words, emitted = backend.compute_stable_prefix_words_to_emit(
+        ["hi"], 0, True, 2
+    )
+    assert words == ["hi"] and emitted == 1
+
+
 def test_default_options_match_official_defaults():
     defaults = backend.default_moonshine_transcriber_options()
     assert defaults["max_tokens_per_second"] == 6.5

@@ -57,7 +57,7 @@ def test_moonshine_streaming_on_cpu_produces_non_empty_text():
     from moonshine_streaming_backend import (
         MOONSHINE_AUDIO_SAMPLE_RATE_HZ,
         build_streaming_transcriber_from_local_model_directory,
-        make_completed_line_forwarding_listener,
+        make_stable_prefix_streaming_listener,
     )
 
     import librosa
@@ -68,7 +68,7 @@ def test_moonshine_streaming_on_cpu_produces_non_empty_text():
 
     collected_completed_line_texts = []
 
-    listener = make_completed_line_forwarding_listener(
+    listener = make_stable_prefix_streaming_listener(
         lambda begin_s, end_s, text: collected_completed_line_texts.append(text)
     )
 

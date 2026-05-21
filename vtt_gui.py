@@ -67,7 +67,8 @@ WHISPER_TUNABLE_OPTION_SPECS = (
         "help": (
             "Smallest slice of audio transcribed at a time.\n"
             "Lower = words appear sooner (snappier) but more CPU and slightly "
-            "less stable.\nRaise if it feels choppy or CPU-heavy."
+            "less stable.\nRaise if it feels choppy or CPU-heavy.\n"
+            "Typical: 0.3–2.0 s (default 0.5)."
         ),
     },
     {
@@ -76,7 +77,8 @@ WHISPER_TUNABLE_OPTION_SPECS = (
         "help": (
             "Seconds of recent audio kept as context before older, already-"
             "typed audio is dropped.\nRaise for more context (can help "
-            "accuracy) at higher CPU cost; lower for lighter, less context."
+            "accuracy) at higher CPU cost; lower for lighter, less context.\n"
+            "Typical: 5–20 s (default 8)."
         ),
     },
     {
@@ -676,6 +678,8 @@ class VttGuiApplication:
 
         self._build_widgets()
         self.tk_root.protocol("WM_DELETE_WINDOW", self._on_window_close)
+        # Any left-click commits the numeric setting fields (see handler).
+        self.tk_root.bind("<Button-1>", self._on_global_left_click, add="+")
 
         TRANSCRIPTS_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
@@ -700,6 +704,23 @@ class VttGuiApplication:
     # ---- UI ---------------------------------------------------------------
 
     def _build_widgets(self):
+        # Give all ttk Comboboxes a white field + white drop-down list so they
+        # stand out against the grey window instead of blending in.
+        from tkinter import ttk as _tk_ttk_module_for_style
+        combobox_style = _tk_ttk_module_for_style.Style()
+        combobox_style.configure(
+            "TCombobox",
+            fieldbackground="white",
+            background="white",
+        )
+        combobox_style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "white"), ("disabled", "#eeeeee")],
+        )
+        # The drop-down popup is a Tk Listbox styled via the option database.
+        self.tk_root.option_add("*TCombobox*Listbox.background", "white")
+        self.tk_root.option_add("*TCombobox*Listbox.foreground", "#000000")
+
         # Status text variable — the actual Label widget is created later
         # (inside the status_and_model_row_frame so it shares a row with
         # the model dropdown).
@@ -1655,6 +1676,29 @@ class VttGuiApplication:
         if hasattr(self, "moonshine_settings_restart_notice_var"):
             self.moonshine_settings_restart_notice_var.set("")
 
+    def _on_global_left_click(self, event):
+        """Any left-click anywhere in the window commits the numeric setting
+        fields, so clicking away after typing applies the value (and shows the
+        'changed' notice if relevant). Unchanged fields are a no-op. This is
+        more reliable than depending on <FocusOut> alone."""
+        self._commit_all_numeric_setting_fields()
+
+    def _commit_all_numeric_setting_fields(self):
+        """Run the commit/validate path for every numeric (Entry) setting in
+        both engines. Choice/flag widgets commit on their own change events, so
+        only the float fields need this."""
+        if hasattr(self, "whisper_setting_spec_by_key"):
+            for spec in WHISPER_TUNABLE_OPTION_SPECS:
+                if spec["kind"] == "float":
+                    self._on_whisper_float_setting_committed(spec["key"])
+        if hasattr(self, "moonshine_setting_string_var_by_key"):
+            for (
+                gui_setting_key, _option_name, default_value, _label, help_text
+            ) in moonshine_streaming_backend.MOONSHINE_TUNABLE_OPTION_SPECS:
+                self._on_moonshine_setting_field_committed(
+                    gui_setting_key, default_value, help_text
+                )
+
     # ---- Right-click context menu for text widgets -----------------------
 
     def _attach_right_click_context_menu_to_text_widget(
@@ -1696,6 +1740,10 @@ class VttGuiApplication:
         text_widget.bind("<Button-3>", show_context_menu_at_pointer)
         text_widget.bind("<Button-2>", show_context_menu_at_pointer)
         text_widget.bind("<Control-Button-1>", show_context_menu_at_pointer)
+        # A plain left-click anywhere in the widget dismisses the menu.
+        text_widget.bind(
+            "<Button-1>", lambda event: context_menu.unpost(), add="+"
+        )
 
     @staticmethod
     def _select_all_text_in_widget(text_widget):

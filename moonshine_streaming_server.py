@@ -31,7 +31,7 @@ from moonshine_streaming_backend import (
     MOONSHINE_AUDIO_SAMPLE_RATE_HZ,
     MOONSHINE_TUNABLE_OPTION_SPECS,
     build_streaming_transcriber_from_local_model_directory,
-    make_completed_line_forwarding_listener,
+    make_stable_prefix_streaming_listener,
 )
 
 
@@ -56,7 +56,7 @@ class MoonshineOneClientConnectionHandler:
         self._transcriber = transcriber
         self._last_line_sent_to_avoid_duplicates = None
 
-    def _send_completed_line(self, begin_seconds, end_seconds, text):
+    def _send_transcript_text(self, begin_seconds, end_seconds, text):
         wire_line = format_transcript_line_for_wire(begin_seconds, end_seconds, text)
         if wire_line == self._last_line_sent_to_avoid_duplicates:
             return
@@ -71,8 +71,11 @@ class MoonshineOneClientConnectionHandler:
     def process_until_client_disconnects(self):
         # Each connection gets its own fresh streaming session (start()),
         # so transcripts never bleed across connections / dictation runs.
-        forwarding_listener = make_completed_line_forwarding_listener(
-            self._send_completed_line
+        # The stable-prefix listener streams each line's settled words live and
+        # flushes the held-back tail on finalize — so downstream gets a live
+        # word-by-word feel while only ever receiving text that won't change.
+        forwarding_listener = make_stable_prefix_streaming_listener(
+            self._send_transcript_text
         )
         self._transcriber.remove_all_listeners()
         self._transcriber.add_listener(forwarding_listener)

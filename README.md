@@ -2,266 +2,134 @@
 
 [![CI](https://github.com/RandyHaylor/voice-to-text-type-tally/actions/workflows/ci.yml/badge.svg)](https://github.com/RandyHaylor/voice-to-text-type-tally/actions/workflows/ci.yml)
 
-Real-time, fully offline voice transcription with a tkinter GUI. Built on
-[whisper_streaming](https://github.com/ufal/whisper_streaming) (LocalAgreement
-streaming over OpenAI Whisper) running entirely on your machine — nothing
-goes to the cloud.
+Real-time, fully offline speech-to-text with a tkinter GUI — types straight into the focused window as you talk. Nothing leaves your machine.
 
-**Modes (click a button in the GUI):**
+## Two engines, pick from the Model dropdown
 
-- **Mic — show in window only** — preview transcription, no typing or file
-- **Mic — type into focused window** — auto-types into the focused app
-- **Mic — save to file** — appends to `~/vtt_recordings/*.txt`
-- **System audio — save to file** — captures what's playing on your speakers
-- **Mic + System mixed — save to file** — both inputs in one transcript
+- **Whisper** — `whisper_streaming` (LocalAgreement over OpenAI Whisper)
+  - multilingual · GPU **or** CPU · commits word-by-word as you speak
+- **Moonshine** — official `moonshine-voice` streaming engine
+  - English-only · **CPU-only** (~8× faster than real-time) · streams words live (holds back the last ~2, flushed on pause)
+- Switching models restarts the local server; everything else is identical.
 
-The GUI also includes Start server (GPU/CPU), Stop server, GPU index picker,
-Whisper model picker, transcript Clear / Copy all, and an in-app Help button.
+## Capture modes (GUI buttons)
 
-A separate **Linux-only command-line hotkey UI** (Ctrl+F7..F12) is also
-available for power users — see "Linux: hotkey CLI" near the bottom.
+- **Mic → window** — preview only (no typing/file)
+- **Mic → focused window** — auto-types at the cursor
+- **Mic → file** — appends to `~/vtt_recordings/*.txt`
+- **System audio → file** — captures what's playing on your speakers
+- **Mic + System → file** — both, mixed into one transcript
 
 ## How it works
 
 ```
-mic / system audio → ffmpeg → TCP socket → whisper_streaming server
-                                                    ↓
-                                          committed text lines
-                                                    ↓
-                          GUI prints them / appends to file / types via pynput
+mic / system audio → ffmpeg → TCP 127.0.0.1:43007 → streaming server
+                                                            ↓
+                                                  committed text lines
+                                                            ↓
+                              GUI types (pynput) / appends to file / prints
 ```
 
-The whisper_streaming server runs as a background Python process on
-`127.0.0.1:43007`. The GUI manages its lifecycle (start/stop, GPU/CPU,
-model selection) and pipes audio through it.
+- The GUI owns the server's lifecycle (start/stop, device, model) and pipes audio through it.
 
 ## Install
 
-> Common to all platforms: NVIDIA GPU is **optional** — CPU mode works on
-> any machine but is slower (use the `tiny` or `base` model for usable
-> speed on CPU).
+> NVIDIA GPU is **optional** (Whisper only). CPU works everywhere — use a `tiny`/`base` Whisper model or a Moonshine model for usable CPU speed.
 
 ### Linux (X11) — Ubuntu / Debian / Fedora
 
-1. Install system tools:
+```bash
+sudo apt install -y python3 python3-pip python3-tk \
+    ffmpeg pulseaudio-utils netcat-openbsd xdotool xclip wmctrl
+git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
+cd voice-to-text-type-tally
+pip install -r requirements.txt
+python3 vtt_gui.py
+```
 
-   ```bash
-   sudo apt install -y python3 python3-pip python3-tk \
-       ffmpeg pulseaudio-utils netcat-openbsd xdotool xclip wmctrl
-   ```
-
-2. Clone:
-
-   ```bash
-   git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
-   cd voice-to-text-type-tally
-   ```
-
-3. Install Python deps:
-
-   ```bash
-   pip install -r requirements.txt
-   # GPU users (NVIDIA, optional):
-   pip install nvidia-cudnn-cu12 nvidia-cublas-cu12
-   ```
-
-4. Run the GUI:
-
-   ```bash
-   python3 vtt_gui.py
-   ```
-
-5. Optional — make `vtt` runnable from anywhere:
-
-   ```bash
-   bash launchers/install_linux_desktop_shortcut.sh   # adds an app launcher entry
-   # or:
-   ln -s "$(pwd)/vtt_gui.py" ~/.local/bin/vtt
-   ```
-
-   Note: requires X11. Wayland may need `pynput`'s evdev backend or a
-   different keystroke-injection path.
+- GPU (optional): `pip install nvidia-cudnn-cu12 nvidia-cublas-cu12`
+- Run from anywhere: `ln -s "$(pwd)/vtt_gui.py" ~/.local/bin/vtt` (or `bash launchers/install_linux_desktop_shortcut.sh`)
+- Wayland may need pynput's evdev backend for typing.
 
 ### macOS (Intel & Apple Silicon)
 
-1. Install [Homebrew](https://brew.sh) if you don't have it.
+```bash
+brew install python ffmpeg
+git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
+cd voice-to-text-type-tally
+pip3 install -r requirements.txt
+python3 vtt_gui.py
+```
 
-2. Install system tools:
-
-   ```bash
-   brew install python ffmpeg
-   # System-audio loopback needs a virtual audio device. The repo's
-   # helper installs BlackHole via brew (one-time, requires kernel-ext
-   # approval in System Settings → Privacy & Security):
-   bash mac/install_blackhole_via_brew.sh
-   ```
-
-3. Clone:
-
-   ```bash
-   git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
-   cd voice-to-text-type-tally
-   ```
-
-4. Install Python deps:
-
-   ```bash
-   pip3 install -r requirements.txt
-   ```
-
-5. Run the GUI:
-
-   ```bash
-   python3 vtt_gui.py
-   ```
-
-6. Optional — Desktop shortcut:
-
-   ```bash
-   bash launchers/install_macos_desktop_shortcut.sh
-   ```
-
-7. Grant **Accessibility** permission to the terminal (or to Python) in
-   System Settings → Privacy & Security if you want the "type into
-   focused window" mode to work.
-
-GPU support: macOS doesn't run CUDA. Use CPU mode (the GUI's "Start
-server (CPU)" button is enabled by default on Macs).
+- System-audio capture needs a loopback device: `bash mac/install_blackhole_via_brew.sh`
+- "Type into focused window" needs **Accessibility** permission (System Settings → Privacy & Security).
+- No CUDA on macOS → CPU mode (Moonshine is the fast CPU option).
 
 ### Windows 10 / 11
 
-1. Install **Python 3.11+** from [python.org](https://www.python.org/downloads/windows/).
-   On the first installer screen, **check "Add python.exe to PATH"**.
+```powershell
+winget install Gyan.FFmpeg
+git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
+cd voice-to-text-type-tally
+pip install -r requirements.txt
+python vtt_gui.py
+```
 
-2. Install **ffmpeg** — pick one:
-   - `winget install Gyan.FFmpeg`
-   - or download a build from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)
-     and add the `bin` folder to your PATH
-
-3. Clone (Git for Windows):
-
-   ```powershell
-   git clone --recurse-submodules https://github.com/RandyHaylor/voice-to-text-type-tally
-   cd voice-to-text-type-tally
-   ```
-
-4. Install Python deps:
-
-   ```powershell
-   pip install -r requirements.txt
-   # GPU users (NVIDIA, optional):
-   pip install nvidia-cudnn-cu12 nvidia-cublas-cu12
-   ```
-
-5. Run the GUI:
-
-   ```powershell
-   python vtt_gui.py
-   ```
-
-6. Optional — Desktop shortcut (uses pythonw.exe, no extra console):
-
-   ```powershell
-   launchers\install_windows_desktop_shortcut.bat
-   ```
-
-System-audio capture on Windows uses WASAPI loopback (handled by ffmpeg).
-Older ffmpeg builds may lack `wasapi loopback`; in that case, enable
-"Stereo Mix" in Sound settings as a fallback, or install a recent ffmpeg.
+- Python 3.11+ from [python.org](https://www.python.org/downloads/windows/) — check **"Add python.exe to PATH"**.
+- GPU (optional): `pip install nvidia-cudnn-cu12 nvidia-cublas-cu12`
+- System audio uses WASAPI loopback via ffmpeg; if missing, enable "Stereo Mix" or update ffmpeg.
 
 ## Models
 
-Whisper model files live in `<repo>/models/<name>/`. The GUI's Model
-dropdown lists every supported size; entries with **●** are present
-locally, **○** are not on disk. Selecting a not-installed entry logs a
-hint to read Help; selecting an installed entry stops/restarts the
-server with the new model.
+- Live in `<repo>/models/<name>/`; the dropdown marks installed (**●**) vs not (**○**).
+- **Bundled via Git LFS:**
+  - Whisper: `tiny`, `tiny.en`, `base`, `base.en`
+  - Moonshine: `moonshine-tiny-streaming` (~80 MB), `moonshine-small-streaming` (~235 MB)
+- **Add more Whisper sizes** — drop a faster-whisper/CTranslate2 dir (`model.bin`, `config.json`, `tokenizer.json`, `vocabulary.txt`) into `models/<size>/`. Source: [`Systran/faster-whisper-*`](https://huggingface.co/Systran). One-liners in `HELP.md`.
+- **(Re)download Moonshine weights:**
+  ```bash
+  pip install moonshine-voice
+  python3 download_moonshine_models_to_local_models_directory.py   # add `tiny` or `small` for one
+  ```
 
-Models bundled in this repo (via Git LFS): `tiny`, `tiny.en`, `base`,
-`base.en` (Whisper, multilingual + English-only) and
-`moonshine-tiny-streaming`, `moonshine-small-streaming` (Moonshine
-streaming, English-only, CPU real-time). Larger Whisper models (`small`
-upward) are not committed. To add more Whisper sizes, drop a
-faster-whisper / CTranslate2 model directory into `<repo>/models/<size>/`
-so it contains `model.bin`, `config.json`, `tokenizer.json`,
-`vocabulary.txt`. Sources include the
-[`Systran/faster-whisper-*`](https://huggingface.co/Systran) repos on
-Hugging Face Hub. See `HELP.md` for one-liner download commands.
+## GUI reference
 
-### Moonshine vs Whisper
+- **Capture** — the five mode buttons; **Stop** ends the active mode.
+- **Server** — Start (GPU)/(CPU), Stop server, GPU-index picker.
+  - GPU button disables when a Moonshine model is selected (CPU-only); Stop disables when no server runs.
+- **Model & settings**
+  - Model dropdown — switch Whisper *or* Moonshine engine (auto-restarts server).
+  - Per-engine settings rows (Whisper / Moonshine) — hover tooltips (with typical ranges); **Restore defaults** per row.
+    - Saved instantly; **apply on next server restart** (a "⚠ changed" notice shows until then). Editing a number then clicking anywhere applies it.
+- **Transcript** — editable pane; Clear / Copy all; right-click for Cut/Copy/Paste/Select All.
+- **Help** — in-app `HELP.md` viewer. Status row shows server UP/DOWN + mode.
 
-Moonshine (`moonshine-tiny-streaming`, `moonshine-small-streaming`) is an
-alternative ASR engine built for very low-latency, CPU real-time
-transcription. It uses Moonshine's **own official streaming engine** (the
-[`moonshine-voice`](https://pypi.org/project/moonshine-voice/) package,
-Moonshine v2 streaming models) — a separate, self-contained server with
-its own bundled CPU ONNX runtime. It does **not** share Whisper's
-`whisper_streaming` pipeline; selecting a Moonshine model just starts a
-different server on the same port and wire protocol.
+## Settings persistence
 
-Moonshine is **English-only and CPU-only** here (fast CPU inference is its
-whole point — ~8x faster than real-time, ~65-90 ms per finalized line on a
-typical CPU). Text commits at speech-endpoint (phrase) granularity:
-Moonshine finalizes a line when you pause, and that line is typed/logged.
-
-To (re)download the Moonshine streaming weights into `<repo>/models/`:
-
-```bash
-pip install moonshine-voice
-python3 download_moonshine_models_to_local_models_directory.py
-# or just one size:
-python3 download_moonshine_models_to_local_models_directory.py tiny
-```
-
-## GUI quick reference
-
-| Control | Effect |
-| --- | --- |
-| Mic — show in window only | Preview only, no typing/file |
-| Mic — type into focused window | Auto-types as words commit |
-| Mic — save to file | Console + appends to `~/vtt_recordings/mic_transcript_*.txt` |
-| System audio — save to file | Captures speakers/output to `~/vtt_recordings/*.txt` |
-| Mic + System mixed — save to file | Both inputs combined to one file |
-| Stop | End the active mode |
-| Start server (GPU) / (CPU) | Restart the server on the chosen device |
-| Stop server | Kill the server (auto-restarts when you click a mode that needs it) |
-| GPU index | Pick which NVIDIA GPU (sets `CUDA_VISIBLE_DEVICES`) |
-| Model dropdown | Switch the loaded Whisper model (auto-restarts server) |
-| Open transcripts folder | Opens `~/vtt_recordings/` in your file manager |
-| Clear / Copy all | Manage the editable transcript pane |
-| Help | Open in-app HELP.md viewer |
-
-Server status (UP / DOWN, current mode) is shown in the row to the
-right of the buttons. The transcript pane is editable so you can copy,
-correct, and rearrange text live.
+- Saved to `~/.voice-to-text-type-tally/settings.json` (cross-platform), restored on launch.
+- Remembers: device (GPU/CPU), selected model, and all Whisper + Moonshine tunables.
 
 ## Linux: hotkey CLI (older flow)
 
-For users who prefer global hotkeys over the GUI, the original Linux
-command-line app is still in the repo:
-
-```bash
-bash vtt
-```
-
-It binds `Ctrl+F7..F12` to the same modes the GUI exposes.
-See `whisper_streaming_hotkey_controller.py` for details.
+- Global hotkeys instead of the GUI: `bash vtt` binds `Ctrl+F7..F12` to the same modes.
+- See `whisper_streaming_hotkey_controller.py`.
 
 ## Files
 
 | Path | Purpose |
 | --- | --- |
-| `vtt_gui.py` | The cross-platform tkinter GUI (main entry point) |
-| `cross_platform_audio_sources.py` | Linux/Mac/Windows audio capture helpers |
-| `whisper_streaming_server_runner_with_device_choice.py` | Wrapper that runs the server with GPU/CPU honor |
-| `vtt`, `launch_whisper_streaming_*.sh` | Linux-only hotkey-CLI flow |
-| `launchers/` | Per-platform desktop-shortcut installers |
-| `mac/install_blackhole_via_brew.sh` | macOS BlackHole helper |
-| `models/` | Whisper model files (LFS-tracked tiny/tiny.en/base/base.en) |
+| `vtt_gui.py` | Cross-platform tkinter GUI (main entry point) |
+| `cross_platform_audio_sources.py` | Audio capture helpers (Linux/Mac/Windows) |
+| `user_settings_persistence.py` | Reads/writes the settings JSON |
+| `whisper_streaming_server_runner_with_device_choice.py` | Whisper server wrapper (GPU/CPU) |
+| `moonshine_streaming_server.py` · `moonshine_streaming_backend.py` | Moonshine streaming server + engine |
+| `download_moonshine_models_to_local_models_directory.py` | Fetch Moonshine weights into `models/` |
+| `vtt`, `launch_whisper_streaming_*.sh` | Linux-only hotkey CLI |
+| `launchers/` · `mac/install_blackhole_via_brew.sh` | Desktop shortcuts · macOS loopback helper |
+| `models/` | Bundled weights (LFS): Whisper tiny/base + Moonshine streaming |
 | `whisper_streaming/` | Submodule: [ufal/whisper_streaming](https://github.com/ufal/whisper_streaming) |
-| `HELP.md` | In-app help, also viewable on GitHub |
+| `HELP.md` | In-app help |
 
 ## License
 
-MIT — see `LICENSE`. The `whisper_streaming` submodule carries its own
-license.
+MIT — see `LICENSE`. The `whisper_streaming` submodule carries its own license.

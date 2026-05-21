@@ -58,7 +58,8 @@ MOONSHINE_TUNABLE_OPTION_SPECS = (
         "Caps how much text it emits per second of audio — the main guard "
         "against hallucinated garbage during pauses.\n"
         "Lower it if you see runaway nonsense; raise it if genuinely fast "
-        "speech gets cut short. (default 6.5)",
+        "speech gets cut short.\n"
+        "Typical: 4–13 (default 6.5; use ~13 for non-Latin scripts).",
     ),
     (
         "moonshine_vad_window_duration",
@@ -67,17 +68,18 @@ MOONSHINE_TUNABLE_OPTION_SPECS = (
         "VAD window (s)",
         "Seconds of audio the pause-detector averages over.\n"
         "Raise to be more patient with slow/halting speech (won't cut you off "
-        "mid-thought); lower for snappier finalization. (default 0.5)",
+        "mid-thought); lower for snappier finalization.\n"
+        "Typical: 0.3–1.5 s (default 0.5).",
     ),
     (
         "moonshine_vad_threshold",
         "vad_threshold",
         0.5,
         "VAD threshold",
-        "How sure it must be that a sound is speech.\n"
+        "How sure it must be that a sound is speech (probability 0.0–1.0).\n"
         "Lower = more tolerant of pauses / quiet talking (but may grab "
         "background noise); raise to ignore noise (but may clip soft "
-        "speech). (default 0.5)",
+        "speech).\nTypical: 0.3–0.7 (default 0.5).",
     ),
     (
         "moonshine_vad_max_segment_duration",
@@ -86,7 +88,7 @@ MOONSHINE_TUNABLE_OPTION_SPECS = (
         "Max segment (s)",
         "Longest a single line grows before it's force-finished.\n"
         "Raise for long unbroken sentences; lower to force more frequent "
-        "line breaks. (default 15)",
+        "line breaks.\nTypical: 3–30 s (default 15).",
     ),
 )
 
@@ -151,26 +153,78 @@ def _import_transcript_event_listener_base_class():
     return TranscriptEventListener
 
 
-def make_completed_line_forwarding_listener(
-    on_completed_line_text: Callable[[float, float, str], None],
-):
-    """Build a TranscriptEventListener that forwards each FINALIZED line to
-    `on_completed_line_text(begin_seconds, end_seconds, text)`.
+# How many trailing words of the current (not-yet-finalized) line to hold back
+# before emitting downstream. Moonshine v2 only revises roughly the last
+# ~320 ms of audio (~1 word at normal speech rates; see the v2 paper), so
+# holding back 2 words is a safe margin: anything we emit is past the revision
+# window and won't change — which lets the append-only typer stream live text
+# WITHOUT ever needing to backspace. The held-back tail is flushed when the
+# line finalizes (on pause / max-segment).
+DEFAULT_HELD_BACK_WORD_COUNT = 2
 
-    We deliberately ignore interim (on_line_text_changed) events: the app
-    types committed text additively at the cursor and has no way to retract a
-    provisional guess, so only finalized lines are emitted downstream.
+
+def compute_stable_prefix_words_to_emit(
+    current_line_words,
+    already_emitted_word_count,
+    is_line_finalized,
+    held_back_word_count=DEFAULT_HELD_BACK_WORD_COUNT,
+):
+    """Pure helper: given the current full word list for a line, how many of
+    its words we've already emitted, and whether the line is finalized, return
+    (words_to_emit_now, new_emitted_word_count).
+
+    While streaming we only emit up to len-held_back words (the stable prefix);
+    on finalize we emit everything remaining (including the held-back tail).
+    """
+    if is_line_finalized:
+        target_word_count = len(current_line_words)
+    else:
+        target_word_count = max(0, len(current_line_words) - held_back_word_count)
+    if target_word_count <= already_emitted_word_count:
+        return [], already_emitted_word_count
+    return (
+        current_line_words[already_emitted_word_count:target_word_count],
+        target_word_count,
+    )
+
+
+def make_stable_prefix_streaming_listener(
+    on_emit_text: Callable[[float, float, str], None],
+    held_back_word_count: int = DEFAULT_HELD_BACK_WORD_COUNT,
+):
+    """Build a TranscriptEventListener that streams each line's STABLE PREFIX
+    (all but the last `held_back_word_count` words) as it grows, then flushes
+    the held-back tail when the line finalizes. Each call to `on_emit_text`
+    delivers only NEW words (never previously-emitted ones), so a downstream
+    append-only typer can stream live text without retraction.
     """
     TranscriptEventListener = _import_transcript_event_listener_base_class()
 
-    class CompletedLineForwardingListener(TranscriptEventListener):
-        def on_line_completed(self, event):
-            line = event.line
-            text = (line.text or "").strip()
-            if not text:
-                return
-            begin_seconds = float(line.start_time)
-            end_seconds = float(line.start_time) + float(line.duration)
-            on_completed_line_text(begin_seconds, end_seconds, text)
+    class StablePrefixStreamingListener(TranscriptEventListener):
+        def __init__(self):
+            # line_id -> count of words already emitted for that line.
+            self._emitted_word_count_by_line_id = {}
 
-    return CompletedLineForwardingListener()
+        def on_line_text_changed(self, event):
+            self._emit_new_stable_words(event.line, is_line_finalized=False)
+
+        def on_line_completed(self, event):
+            self._emit_new_stable_words(event.line, is_line_finalized=True)
+
+        def _emit_new_stable_words(self, line, is_line_finalized):
+            line_id = line.line_id
+            current_words = (line.text or "").split()
+            already_emitted = self._emitted_word_count_by_line_id.get(line_id, 0)
+            words_to_emit, new_emitted_count = compute_stable_prefix_words_to_emit(
+                current_words, already_emitted, is_line_finalized,
+                held_back_word_count,
+            )
+            if words_to_emit:
+                begin_seconds = float(line.start_time)
+                end_seconds = float(line.start_time) + float(line.duration)
+                on_emit_text(begin_seconds, end_seconds, " ".join(words_to_emit))
+            self._emitted_word_count_by_line_id[line_id] = new_emitted_count
+            if is_line_finalized:
+                self._emitted_word_count_by_line_id.pop(line_id, None)
+
+    return StablePrefixStreamingListener()
