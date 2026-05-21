@@ -152,6 +152,54 @@ SHERPA_TUNABLE_OPTION_SPECS = (
 )
 
 
+def engine_for_model_name(model_name):
+    """Resolve a model name to its engine: 'sherpa', 'moonshine', or 'whisper'.
+    Data-driven so a future engine is just another prefix check."""
+    if is_sherpa_model_name(model_name):
+        return "sherpa"
+    if is_moonshine_model_name(model_name):
+        return "moonshine"
+    return "whisper"
+
+
+def normalized_option_specs_for_engine(engine):
+    """Return this engine's tunable options as a uniform list of dicts:
+    {key, kind ('float'|'choice'|'flag'), default, label, help, choices?}.
+    Moonshine's legacy 5-tuple specs are adapted to the dict shape here."""
+    if engine == "whisper":
+        return [dict(spec) for spec in WHISPER_TUNABLE_OPTION_SPECS]
+    if engine == "sherpa":
+        return [dict(spec) for spec in SHERPA_TUNABLE_OPTION_SPECS]
+    if engine == "moonshine":
+        normalized = []
+        for (gui_key, _opt_name, default_value, short_label, help_text) in (
+            moonshine_streaming_backend.MOONSHINE_TUNABLE_OPTION_SPECS
+        ):
+            normalized.append({
+                "key": gui_key, "kind": "float", "default": default_value,
+                "label": short_label, "help": help_text,
+            })
+        return normalized
+    return []
+
+
+# Per-SPECIFIC-MODEL default overrides: model name -> {option_key: default}.
+# Layered on top of the engine's option default. Empty by default (engine
+# defaults apply); populate to give a specific model its own sensible preset.
+PER_MODEL_DEFAULT_OVERRIDES = {
+    # e.g. "tiny.en": {"whisper_min_chunk_size": 0.3},
+}
+
+
+def effective_default_for_model_option(model_name, option_spec):
+    """The default for one option on one specific model: a per-model override
+    if present, else the engine option's default."""
+    overrides = PER_MODEL_DEFAULT_OVERRIDES.get(model_name, {})
+    if option_spec["key"] in overrides:
+        return overrides[option_spec["key"]]
+    return option_spec["default"]
+
+
 class HoverTooltip:
     """Minimal hover tooltip for a Tk widget — shows a small popup with
     wrapped text while the pointer is over the widget. tkinter has no native
@@ -731,6 +779,10 @@ class VttGuiApplication:
         except Exception:
             self._loopback_available = False
 
+        # One-time, idempotent migration of any legacy flat tunable settings to
+        # the per-model schema (must run before the panel reads per-model values).
+        user_settings_persistence.migrate_flat_settings_to_per_model()
+
         # Right-click context menus get registered here so we can dismiss them
         # all when the application window loses focus.
         self._context_menus = []
@@ -1012,14 +1064,8 @@ class VttGuiApplication:
             lambda event: self._on_whisper_model_selection_changed(),
         )
 
-        # ---- Row: Whisper settings (apply on server restart) ------------
-        self._build_whisper_settings_row()
-
-        # ---- Row: Moonshine settings (apply on server restart) ----------
-        self._build_moonshine_settings_row()
-
-        # ---- Row: sherpa settings (apply on server restart) -------------
-        self._build_sherpa_settings_row()
+        # ---- Row: settings for the ACTIVE model only (dynamic) ----------
+        self._build_active_model_settings_panel_container()
 
         # ---- Row: Server controls (GPU/CPU/Stop + GPU index + status) --
         server_controls_row_frame = tk.Frame(self.tk_root)
@@ -1305,8 +1351,13 @@ class VttGuiApplication:
                 f"        Currently using: {current_model_name}\n"
             )
             return
+        # Commit any half-typed field of the OUTGOING model before switching,
+        # so its value persists to that model (not the incoming one).
+        self._commit_active_model_numeric_fields()
         os.environ["WHISPER_MODEL"] = new_model_name
         user_settings_persistence.persist_whisper_model_selection(new_model_name)
+        # Swap the settings panel to the newly-selected model's settings.
+        self._rebuild_active_model_settings_panel()
         self._append_log_text(
             f"[model] switching to '{new_model_name}' — restarting server...\n"
         )
@@ -1357,6 +1408,236 @@ class VttGuiApplication:
             self.button_start_server_gpu.config(
                 state=tk.NORMAL if self._gpu_is_available else tk.DISABLED
             )
+
+    # ---- Per-model settings panel (single, dynamic) ----------------------
+
+    def _active_model_name(self):
+        return os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL_NAME)
+
+    def _build_active_model_settings_panel_container(self):
+        """Create the single settings-panel container once; it is (re)filled
+        for whichever model is active. Replaces the old always-visible
+        per-engine rows."""
+        self._active_model_settings_container = tk.Frame(self.tk_root)
+        self._active_model_settings_container.pack(
+            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 2)
+        )
+        self.active_setting_var_by_key = {}
+        self.active_setting_spec_by_key = {}
+        self.active_settings_restart_notice_var = tk.StringVar(value="")
+        self._rebuild_active_model_settings_panel()
+
+    def _rebuild_active_model_settings_panel(self):
+        """Render ONLY the active model's settings into the container. Called on
+        startup and whenever the selected model changes."""
+        from tkinter import ttk as _tk_ttk_module
+
+        container = self._active_model_settings_container
+        for child in container.winfo_children():
+            child.destroy()
+        self.active_setting_var_by_key = {}
+        self.active_setting_spec_by_key = {}
+
+        model_name = self._active_model_name()
+        engine = engine_for_model_name(model_name)
+        option_specs = normalized_option_specs_for_engine(engine)
+
+        first_line_frame = tk.Frame(container)
+        first_line_frame.pack(side=tk.TOP, fill=tk.X)
+        second_line_frame = tk.Frame(container)
+        second_line_frame.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Label(
+            first_line_frame,
+            text=f"{engine} · {model_name} (apply on server restart):",
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(side=tk.LEFT)
+
+        # Numeric/choice fields on line 1; on/off flags on line 2.
+        for spec in option_specs:
+            self.active_setting_spec_by_key[spec["key"]] = spec
+            if spec["kind"] in ("float", "choice"):
+                self._render_active_setting_field(
+                    spec, model_name, first_line_frame, _tk_ttk_module
+                )
+        for spec in option_specs:
+            if spec["kind"] == "flag":
+                self._render_active_setting_field(
+                    spec, model_name, second_line_frame, _tk_ttk_module
+                )
+
+        restore_defaults_button = tk.Button(
+            second_line_frame, text="Restore defaults",
+            command=self._on_restore_active_model_defaults_clicked,
+        )
+        restore_defaults_button.pack(side=tk.LEFT, padx=(12, 0))
+        HoverTooltip(
+            restore_defaults_button,
+            "Reset THIS model's settings to its defaults (asks to confirm).",
+        )
+        self.active_settings_restart_notice_var = tk.StringVar(value="")
+        tk.Label(
+            second_line_frame,
+            textvariable=self.active_settings_restart_notice_var,
+            foreground="#b35900",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _render_active_setting_field(self, spec, model_name, parent_frame, ttk_module):
+        setting_key = spec["key"]
+        effective_default = effective_default_for_model_option(model_name, spec)
+        if spec["kind"] == "flag":
+            current_value = user_settings_persistence.read_model_bool_or_default(
+                model_name, setting_key, bool(effective_default)
+            )
+            setting_var = tk.BooleanVar(value=current_value)
+            self.active_setting_var_by_key[setting_key] = setting_var
+            checkbutton = tk.Checkbutton(
+                parent_frame, text=spec["label"], variable=setting_var,
+                command=lambda key=setting_key: self._on_active_flag_changed(key),
+            )
+            checkbutton.pack(side=tk.LEFT, padx=(8, 0))
+            HoverTooltip(checkbutton, spec["help"])
+            return
+
+        label_widget = tk.Label(parent_frame, text=f"   {spec['label']}:")
+        label_widget.pack(side=tk.LEFT)
+        HoverTooltip(label_widget, spec["help"])
+        if spec["kind"] == "float":
+            current_value = user_settings_persistence.read_model_float_or_default(
+                model_name, setting_key, effective_default
+            )
+            setting_var = tk.StringVar(
+                value=self._format_setting_number_for_display(current_value)
+            )
+            self.active_setting_var_by_key[setting_key] = setting_var
+            entry_widget = tk.Entry(parent_frame, textvariable=setting_var, width=6)
+            entry_widget.pack(side=tk.LEFT)
+            HoverTooltip(entry_widget, spec["help"])
+            commit_callback = (
+                lambda event, key=setting_key: self._on_active_float_committed(key)
+            )
+            entry_widget.bind("<FocusOut>", commit_callback)
+            entry_widget.bind("<Return>", commit_callback)
+        elif spec["kind"] == "choice":
+            current_value = user_settings_persistence.read_model_string_or_default(
+                model_name, setting_key, effective_default, allowed_values=spec["choices"]
+            )
+            setting_var = tk.StringVar(value=current_value)
+            self.active_setting_var_by_key[setting_key] = setting_var
+            combobox_widget = ttk_module.Combobox(
+                parent_frame, textvariable=setting_var,
+                values=list(spec["choices"]), state="readonly", width=9,
+            )
+            combobox_widget.pack(side=tk.LEFT)
+            combobox_widget.bind(
+                "<<ComboboxSelected>>",
+                lambda event, key=setting_key: self._on_active_choice_changed(key),
+            )
+
+    def _on_active_float_committed(self, setting_key):
+        spec = self.active_setting_spec_by_key.get(setting_key)
+        if spec is None:
+            return
+        model_name = self._active_model_name()
+        effective_default = effective_default_for_model_option(model_name, spec)
+        setting_var = self.active_setting_var_by_key[setting_key]
+        raw_text = setting_var.get().strip()
+        try:
+            parsed_value = float(raw_text)
+            if (
+                parsed_value != parsed_value
+                or parsed_value in (float("inf"), float("-inf"))
+                or parsed_value < 0
+            ):
+                raise ValueError("out of range")
+        except ValueError:
+            reverted = user_settings_persistence.read_model_float_or_default(
+                model_name, setting_key, effective_default
+            )
+            setting_var.set(self._format_setting_number_for_display(reverted))
+            self._append_log_text(
+                f"[settings] ignored invalid value for {setting_key!r} "
+                f"(reverted to {reverted}).\n"
+            )
+            return
+        current = user_settings_persistence.read_model_float_or_default(
+            model_name, setting_key, effective_default
+        )
+        setting_var.set(self._format_setting_number_for_display(parsed_value))
+        if parsed_value == current:
+            return
+        user_settings_persistence.persist_model_setting(
+            model_name, setting_key, parsed_value
+        )
+        self._note_active_settings_changed_pending_restart()
+
+    def _on_active_choice_changed(self, setting_key):
+        spec = self.active_setting_spec_by_key.get(setting_key)
+        if spec is None:
+            return
+        model_name = self._active_model_name()
+        effective_default = effective_default_for_model_option(model_name, spec)
+        new_value = self.active_setting_var_by_key[setting_key].get()
+        current = user_settings_persistence.read_model_string_or_default(
+            model_name, setting_key, effective_default, allowed_values=spec["choices"]
+        )
+        if new_value == current:
+            return
+        user_settings_persistence.persist_model_setting(
+            model_name, setting_key, new_value
+        )
+        self._note_active_settings_changed_pending_restart()
+
+    def _on_active_flag_changed(self, setting_key):
+        spec = self.active_setting_spec_by_key.get(setting_key)
+        if spec is None:
+            return
+        model_name = self._active_model_name()
+        effective_default = effective_default_for_model_option(model_name, spec)
+        new_value = bool(self.active_setting_var_by_key[setting_key].get())
+        current = user_settings_persistence.read_model_bool_or_default(
+            model_name, setting_key, bool(effective_default)
+        )
+        if new_value == current:
+            return
+        user_settings_persistence.persist_model_setting(
+            model_name, setting_key, new_value
+        )
+        self._note_active_settings_changed_pending_restart()
+
+    def _on_restore_active_model_defaults_clicked(self):
+        model_name = self._active_model_name()
+        if not messagebox.askyesno(
+            "Restore model defaults",
+            f"Restore default settings for {model_name}?\n\n"
+            "Your custom settings for this model will be overwritten.",
+        ):
+            return
+        user_settings_persistence.clear_model_settings(model_name)
+        self._rebuild_active_model_settings_panel()  # re-renders at defaults
+        self._append_log_text(
+            f"[settings] {model_name} settings restored to defaults.\n"
+        )
+        self._note_active_settings_changed_pending_restart()
+
+    def _note_active_settings_changed_pending_restart(self):
+        if hasattr(self, "active_settings_restart_notice_var"):
+            self.active_settings_restart_notice_var.set(
+                "⚠ changed — applies on next server restart"
+            )
+
+    def _clear_active_settings_restart_notice(self):
+        if hasattr(self, "active_settings_restart_notice_var"):
+            self.active_settings_restart_notice_var.set("")
+
+    def _commit_active_model_numeric_fields(self):
+        """Commit any typed-but-uncommitted numeric fields of the active panel
+        (used by the global click handler and before model switches)."""
+        if not hasattr(self, "active_setting_spec_by_key"):
+            return
+        for setting_key, spec in list(self.active_setting_spec_by_key.items()):
+            if spec["kind"] == "float":
+                self._on_active_float_committed(setting_key)
 
     # ---- Whisper settings panel ------------------------------------------
 
@@ -1949,7 +2230,7 @@ class VttGuiApplication:
         fields, so clicking away after typing applies the value (and shows the
         'changed' notice if relevant). Unchanged fields are a no-op. This is
         more reliable than depending on <FocusOut> alone."""
-        self._commit_all_numeric_setting_fields()
+        self._commit_active_model_numeric_fields()
 
     def _commit_all_numeric_setting_fields(self):
         """Run the commit/validate path for every numeric (Entry) setting in
@@ -2082,7 +2363,9 @@ class VttGuiApplication:
         )
 
         if is_sherpa_model_name(whisper_model_name):
-            return self._build_sherpa_server_command_argv(local_model_directory)
+            return self._build_sherpa_server_command_argv(
+                whisper_model_name, local_model_directory
+            )
         if is_moonshine_model_name(whisper_model_name):
             return self._build_moonshine_server_command_argv(
                 whisper_model_name, local_model_directory
@@ -2091,9 +2374,9 @@ class VttGuiApplication:
             whisper_model_name, local_model_directory
         )
 
-    def _build_sherpa_server_command_argv(self, local_model_directory):
+    def _build_sherpa_server_command_argv(self, model_name, local_model_directory):
         """sherpa-onnx is its own CPU-only module. Launch its standalone server
-        with the ASR model dir + the punctuation companion dir, and the user's
+        with the ASR model dir + the punctuation companion dir, and THIS model's
         persisted mode (streaming on by default) + stable-prefix tunables."""
         sherpa_server_script_path = os.path.join(
             SCRIPT_DIRECTORY, "sherpa_streaming_server.py"
@@ -2102,19 +2385,19 @@ class VttGuiApplication:
             LOCAL_MODELS_PARENT_DIRECTORY / SHERPA_PUNCTUATION_MODEL_DIRECTORY_NAME
         )
         streaming_mode_enabled = (
-            user_settings_persistence.read_persisted_bool_or_default(
-                "sherpa_streaming_mode", True
+            user_settings_persistence.read_model_bool_or_default(
+                model_name, "sherpa_streaming_mode", True
             )
         )
         mode = "streaming" if streaming_mode_enabled else "whole_sentence"
-        context_window_words = user_settings_persistence.read_persisted_float_or_default(
-            "sherpa_context_window_words", 32
+        context_window_words = user_settings_persistence.read_model_float_or_default(
+            model_name, "sherpa_context_window_words", 32
         )
-        mutable_suffix_words = user_settings_persistence.read_persisted_float_or_default(
-            "sherpa_mutable_suffix_words", 4
+        mutable_suffix_words = user_settings_persistence.read_model_float_or_default(
+            model_name, "sherpa_mutable_suffix_words", 4
         )
-        stability_delay_words = user_settings_persistence.read_persisted_float_or_default(
-            "sherpa_stability_delay_words", 3
+        stability_delay_words = user_settings_persistence.read_model_float_or_default(
+            model_name, "sherpa_stability_delay_words", 3
         )
         return [
             sys.executable,
@@ -2157,28 +2440,32 @@ class VttGuiApplication:
             *model_args,
             "--lan", "en",
         ]
-        whisper_argv.extend(self._build_whisper_tunable_option_argv())
+        whisper_argv.extend(
+            self._build_whisper_tunable_option_argv(whisper_model_name)
+        )
         whisper_argv.extend(["-l", "INFO"])
         return whisper_argv
 
-    def _build_whisper_tunable_option_argv(self):
-        """Translate the persisted (or default) Whisper tunable settings into
-        argv flags for the whisper_streaming server runner."""
+    def _build_whisper_tunable_option_argv(self, whisper_model_name):
+        """Translate the active model's persisted (or per-model-default) Whisper
+        tunable settings into argv flags for the whisper_streaming runner."""
         option_argv = []
         for spec in WHISPER_TUNABLE_OPTION_SPECS:
+            default = effective_default_for_model_option(whisper_model_name, spec)
             if spec["kind"] == "float":
-                value = user_settings_persistence.read_persisted_float_or_default(
-                    spec["key"], spec["default"]
+                value = user_settings_persistence.read_model_float_or_default(
+                    whisper_model_name, spec["key"], default
                 )
                 option_argv.extend([spec["cli"], str(value)])
             elif spec["kind"] == "choice":
-                value = user_settings_persistence.read_persisted_string_or_default(
-                    spec["key"], spec["default"], allowed_values=spec["choices"]
+                value = user_settings_persistence.read_model_string_or_default(
+                    whisper_model_name, spec["key"], default,
+                    allowed_values=spec["choices"],
                 )
                 option_argv.extend([spec["cli"], value])
             elif spec["kind"] == "flag":
-                value = user_settings_persistence.read_persisted_bool_or_default(
-                    spec["key"], spec["default"]
+                value = user_settings_persistence.read_model_bool_or_default(
+                    whisper_model_name, spec["key"], bool(default)
                 )
                 # store_true flags: append only when enabled.
                 if value:
@@ -2207,9 +2494,8 @@ class VttGuiApplication:
             "--update-interval", "0.5",
             "-l", "INFO",
         ]
-        # Append each tunable Moonshine option using the user's persisted
-        # value (or the official default). The CLI flag for each option is its
-        # transcriber option name with underscores -> dashes.
+        # Append each tunable Moonshine option using THIS model's persisted
+        # value (or its per-model default). CLI flag = option name dashed.
         for (
             gui_setting_key,
             transcriber_option_name,
@@ -2217,9 +2503,13 @@ class VttGuiApplication:
             _label,
             _help,
         ) in moonshine_streaming_backend.MOONSHINE_TUNABLE_OPTION_SPECS:
+            effective_default = effective_default_for_model_option(
+                whisper_model_name,
+                {"key": gui_setting_key, "default": default_value},
+            )
             effective_value = (
-                user_settings_persistence.read_persisted_float_or_default(
-                    gui_setting_key, default_value
+                user_settings_persistence.read_model_float_or_default(
+                    whisper_model_name, gui_setting_key, effective_default
                 )
             )
             moonshine_argv.extend(
@@ -2303,9 +2593,7 @@ class VttGuiApplication:
     def _start_server_async(self):
         # The (re)started server reads the latest persisted settings, so any
         # pending "settings changed" notices are now satisfied.
-        self._clear_moonshine_settings_restart_notice()
-        self._clear_whisper_settings_restart_notice()
-        self._clear_sherpa_settings_restart_notice()
+        self._clear_active_settings_restart_notice()
         try:
             server_argv = self._build_server_command_argv()
             self.server_subprocess_or_none = (
