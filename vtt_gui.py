@@ -112,6 +112,45 @@ WHISPER_TUNABLE_OPTION_SPECS = (
     },
 )
 
+# User-tunable sherpa-onnx settings (its own engine). Same dict shape as the
+# Whisper specs (kinds: flag/float). All apply on server restart.
+SHERPA_TUNABLE_OPTION_SPECS = (
+    {
+        "key": "sherpa_streaming_mode", "kind": "flag", "default": True,
+        "label": "Streaming mode (rolling window)",
+        "help": (
+            "ON = live rolling window: words appear immediately, a short tail "
+            "is editable, older text locks. Low latency.\n"
+            "OFF = whole-sentence mode: nothing appears until you pause, then a "
+            "full punctuated/truecased segment — most accurate punctuation."
+        ),
+    },
+    {
+        "key": "sherpa_context_window_words", "kind": "float", "default": 32.0,
+        "label": "Context words",
+        "help": (
+            "Read-only recent words handed to the punctuation model for better "
+            "punctuation decisions (streaming mode).\nTypical: 16–48."
+        ),
+    },
+    {
+        "key": "sherpa_mutable_suffix_words", "kind": "float", "default": 4.0,
+        "label": "Mutable suffix",
+        "help": (
+            "Trailing words that stay editable before locking (streaming mode). "
+            "Larger = more in-flight coherence, more delay.\nTypical: 2–8."
+        ),
+    },
+    {
+        "key": "sherpa_stability_delay_words", "kind": "float", "default": 3.0,
+        "label": "Stability delay",
+        "help": (
+            "Extra cooling words before a word locks into the never-rewritten "
+            "prefix (streaming mode).\nTypical: 1–5."
+        ),
+    },
+)
+
 
 class HoverTooltip:
     """Minimal hover tooltip for a Tk widget — shows a small popup with
@@ -979,6 +1018,9 @@ class VttGuiApplication:
         # ---- Row: Moonshine settings (apply on server restart) ----------
         self._build_moonshine_settings_row()
 
+        # ---- Row: sherpa settings (apply on server restart) -------------
+        self._build_sherpa_settings_row()
+
         # ---- Row: Server controls (GPU/CPU/Stop + GPU index + status) --
         server_controls_row_frame = tk.Frame(self.tk_root)
         server_controls_row_frame.pack(
@@ -1538,6 +1580,182 @@ class VttGuiApplication:
         if hasattr(self, "whisper_settings_restart_notice_var"):
             self.whisper_settings_restart_notice_var.set("")
 
+    # ---- sherpa settings panel -------------------------------------------
+
+    def _current_selected_model_is_sherpa(self):
+        return is_sherpa_model_name(
+            os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL_NAME)
+        )
+
+    def _build_sherpa_settings_row(self):
+        """sherpa settings: the streaming-mode checkbox (default ON) on line 1,
+        and the stable-prefix numeric tunables on line 2 (relevant in streaming
+        mode), plus Restore-defaults and the apply-on-restart notice. Same
+        pattern as the Whisper/Moonshine rows; tooltips included."""
+        container_frame = tk.Frame(self.tk_root)
+        container_frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 2))
+        first_line_frame = tk.Frame(container_frame)
+        first_line_frame.pack(side=tk.TOP, fill=tk.X)
+        second_line_frame = tk.Frame(container_frame)
+        second_line_frame.pack(side=tk.TOP, fill=tk.X)
+
+        tk.Label(
+            first_line_frame,
+            text="sherpa (apply on server restart):",
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(side=tk.LEFT)
+
+        self.sherpa_setting_var_by_key = {}
+        self.sherpa_setting_spec_by_key = {}
+
+        for spec in SHERPA_TUNABLE_OPTION_SPECS:
+            setting_key = spec["key"]
+            self.sherpa_setting_spec_by_key[setting_key] = spec
+            if spec["kind"] == "flag":
+                current_value = (
+                    user_settings_persistence.read_persisted_bool_or_default(
+                        setting_key, spec["default"]
+                    )
+                )
+                setting_var = tk.BooleanVar(value=current_value)
+                self.sherpa_setting_var_by_key[setting_key] = setting_var
+                checkbutton = tk.Checkbutton(
+                    first_line_frame, text=spec["label"], variable=setting_var,
+                    command=lambda key=setting_key:
+                    self._on_sherpa_flag_setting_changed(key),
+                )
+                checkbutton.pack(side=tk.LEFT, padx=(8, 0))
+                HoverTooltip(checkbutton, spec["help"])
+            else:  # float
+                current_value = (
+                    user_settings_persistence.read_persisted_float_or_default(
+                        setting_key, spec["default"]
+                    )
+                )
+                label_widget = tk.Label(
+                    second_line_frame, text=f"   {spec['label']}:"
+                )
+                label_widget.pack(side=tk.LEFT)
+                HoverTooltip(label_widget, spec["help"])
+                setting_var = tk.StringVar(
+                    value=self._format_setting_number_for_display(current_value)
+                )
+                self.sherpa_setting_var_by_key[setting_key] = setting_var
+                entry_widget = tk.Entry(
+                    second_line_frame, textvariable=setting_var, width=6
+                )
+                entry_widget.pack(side=tk.LEFT)
+                HoverTooltip(entry_widget, spec["help"])
+                commit_callback = (
+                    lambda event, key=setting_key:
+                    self._on_sherpa_float_setting_committed(key)
+                )
+                entry_widget.bind("<FocusOut>", commit_callback)
+                entry_widget.bind("<Return>", commit_callback)
+
+        restore_defaults_button = tk.Button(
+            second_line_frame, text="Restore defaults",
+            command=self._on_restore_sherpa_defaults_clicked,
+        )
+        restore_defaults_button.pack(side=tk.LEFT, padx=(12, 0))
+        HoverTooltip(
+            restore_defaults_button,
+            "Reset all sherpa settings to their defaults (asks to confirm).",
+        )
+        self.sherpa_settings_restart_notice_var = tk.StringVar(value="")
+        tk.Label(
+            second_line_frame,
+            textvariable=self.sherpa_settings_restart_notice_var,
+            foreground="#b35900",
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _on_sherpa_float_setting_committed(self, setting_key):
+        spec = self.sherpa_setting_spec_by_key[setting_key]
+        setting_var = self.sherpa_setting_var_by_key[setting_key]
+        raw_text = setting_var.get().strip()
+        try:
+            parsed_value = float(raw_text)
+            if (
+                parsed_value != parsed_value
+                or parsed_value in (float("inf"), float("-inf"))
+                or parsed_value < 0
+            ):
+                raise ValueError("out of range")
+        except ValueError:
+            reverted_value = (
+                user_settings_persistence.read_persisted_float_or_default(
+                    setting_key, spec["default"]
+                )
+            )
+            setting_var.set(self._format_setting_number_for_display(reverted_value))
+            self._append_log_text(
+                f"[sherpa] ignored invalid value for {setting_key!r} "
+                f"(reverted to {reverted_value}).\n"
+            )
+            return
+        current_persisted_value = (
+            user_settings_persistence.read_persisted_float_or_default(
+                setting_key, spec["default"]
+            )
+        )
+        setting_var.set(self._format_setting_number_for_display(parsed_value))
+        if parsed_value == current_persisted_value:
+            return
+        user_settings_persistence.persist_float_setting(setting_key, parsed_value)
+        self._note_sherpa_settings_changed_pending_restart()
+
+    def _on_sherpa_flag_setting_changed(self, setting_key):
+        spec = self.sherpa_setting_spec_by_key[setting_key]
+        new_value = bool(self.sherpa_setting_var_by_key[setting_key].get())
+        current_value = (
+            user_settings_persistence.read_persisted_bool_or_default(
+                setting_key, spec["default"]
+            )
+        )
+        if new_value == current_value:
+            return
+        user_settings_persistence.persist_bool_setting(setting_key, new_value)
+        self._note_sherpa_settings_changed_pending_restart()
+
+    def _on_restore_sherpa_defaults_clicked(self):
+        if not messagebox.askyesno(
+            "Restore sherpa defaults",
+            "Restore default sherpa settings?\n\n"
+            "Your custom sherpa settings will be overwritten.",
+        ):
+            return
+        for spec in SHERPA_TUNABLE_OPTION_SPECS:
+            setting_key = spec["key"]
+            default_value = spec["default"]
+            setting_var = self.sherpa_setting_var_by_key[setting_key]
+            if spec["kind"] == "flag":
+                user_settings_persistence.persist_bool_setting(
+                    setting_key, bool(default_value)
+                )
+                setting_var.set(bool(default_value))
+            else:
+                user_settings_persistence.persist_float_setting(
+                    setting_key, float(default_value)
+                )
+                setting_var.set(
+                    self._format_setting_number_for_display(default_value)
+                )
+        self._append_log_text("[sherpa] settings restored to defaults.\n")
+        self._note_sherpa_settings_changed_pending_restart()
+
+    def _note_sherpa_settings_changed_pending_restart(self):
+        # Only warn when a sherpa model is the loaded engine.
+        if not self._current_selected_model_is_sherpa():
+            return
+        if hasattr(self, "sherpa_settings_restart_notice_var"):
+            self.sherpa_settings_restart_notice_var.set(
+                "⚠ changed — applies on next server restart"
+            )
+
+    def _clear_sherpa_settings_restart_notice(self):
+        if hasattr(self, "sherpa_settings_restart_notice_var"):
+            self.sherpa_settings_restart_notice_var.set("")
+
     # ---- Moonshine settings panel ----------------------------------------
 
     @staticmethod
@@ -1748,6 +1966,10 @@ class VttGuiApplication:
                 self._on_moonshine_setting_field_committed(
                     gui_setting_key, default_value, help_text
                 )
+        if hasattr(self, "sherpa_setting_spec_by_key"):
+            for spec in SHERPA_TUNABLE_OPTION_SPECS:
+                if spec["kind"] == "float":
+                    self._on_sherpa_float_setting_committed(spec["key"])
 
     # ---- Right-click context menu for text widgets -----------------------
 
@@ -2083,6 +2305,7 @@ class VttGuiApplication:
         # pending "settings changed" notices are now satisfied.
         self._clear_moonshine_settings_restart_notice()
         self._clear_whisper_settings_restart_notice()
+        self._clear_sherpa_settings_restart_notice()
         try:
             server_argv = self._build_server_command_argv()
             self.server_subprocess_or_none = (
