@@ -4,12 +4,14 @@
 
 Real-time, fully offline speech-to-text with a tkinter GUI — types straight into the focused window as you talk. Nothing leaves your machine.
 
-## Two engines, pick from the Model dropdown
+## Three engines, pick from the Model dropdown
 
 - **Whisper** — `whisper_streaming` (LocalAgreement over OpenAI Whisper)
   - multilingual · GPU **or** CPU · commits word-by-word as you speak
 - **Moonshine** — official `moonshine-voice` streaming engine
   - English-only · **CPU-only** (~8× faster than real-time) · streams words live (holds back the last ~2, flushed on pause)
+- **sherpa** — `sherpa-onnx` streaming Zipformer + punctuation/truecasing
+  - English-only · **CPU-only** · streaming rolling-window (default) or whole-sentence punctuated mode
 - Switching models restarts the local server; everything else is identical.
 
 ## Capture modes (GUI buttons)
@@ -109,18 +111,24 @@ pipelines. Its live partials show in the server console window.
 
 - **Capture** — the five mode buttons; **Stop** ends the active mode.
 - **Server** — Start (GPU)/(CPU), Stop server, GPU-index picker.
-  - GPU button disables when a Moonshine model is selected (CPU-only); Stop disables when no server runs.
+  - GPU button disables for CPU-only engines (Moonshine, sherpa); Stop disables when no server runs.
 - **Model & settings**
-  - Model dropdown — switch Whisper *or* Moonshine engine (auto-restarts server).
-  - Per-engine settings rows (Whisper / Moonshine) — hover tooltips (with typical ranges); **Restore defaults** per row.
-    - Saved instantly; **apply on next server restart** (a "⚠ changed" notice shows until then). Editing a number then clicking anywhere applies it.
+  - Model dropdown — switch Whisper / Moonshine / sherpa model (auto-restarts server).
+  - **One settings panel shows only the active model's settings** and swaps when you change the model. Hover tooltips (with typical ranges); **Restore defaults** resets that model.
+    - Saved instantly **per specific model**; **apply on next server restart** (a "⚠ changed" notice shows until then). Editing a number then clicking anywhere applies it.
 - **Transcript** — editable pane; Clear / Copy all; right-click for Cut/Copy/Paste/Select All.
 - **Help** — in-app `HELP.md` viewer. Status row shows server UP/DOWN + mode.
 
 ## Settings persistence
 
 - Saved to `~/.voice-to-text-type-tally/settings.json` (cross-platform), restored on launch.
-- Remembers: device (GPU/CPU), selected model, and all Whisper + Moonshine tunables.
+- Remembers the global device (GPU/CPU) + selected model, and **per-model** tunables (`settings["models"][<model>][...]`). Legacy flat settings are migrated automatically on first launch.
+
+## Contributing / internals
+
+See **`DEVELOPMENT.md`** for the architecture, the engine/wire-protocol design,
+the per-model settings system, how to add a new engine, models/LFS, tests, and
+known gotchas.
 
 ## Linux: hotkey CLI (older flow)
 
@@ -133,15 +141,17 @@ pipelines. Its live partials show in the server console window.
 | --- | --- |
 | `vtt_gui.py` | Cross-platform tkinter GUI (main entry point) |
 | `cross_platform_audio_sources.py` | Audio capture helpers (Linux/Mac/Windows) |
-| `user_settings_persistence.py` | Reads/writes the settings JSON |
+| `user_settings_persistence.py` | Per-model settings JSON (read/write/migrate) |
 | `whisper_streaming_server_runner_with_device_choice.py` | Whisper server wrapper (GPU/CPU) |
 | `moonshine_streaming_server.py` · `moonshine_streaming_backend.py` | Moonshine streaming server + engine |
-| `download_moonshine_models_to_local_models_directory.py` | Fetch Moonshine weights into `models/` |
+| `sherpa_streaming_server.py` · `sherpa_streaming_backend.py` | sherpa streaming server + engine (CPU; streaming/whole-sentence) |
+| `download_{moonshine,sherpa}_models_to_local_models_directory.py` | Fetch engine weights into `models/` |
 | `vtt`, `launch_whisper_streaming_*.sh` | Linux-only hotkey CLI |
 | `launchers/` · `mac/install_blackhole_via_brew.sh` | Desktop shortcuts · macOS loopback helper |
-| `models/` | Bundled weights (LFS): Whisper tiny/base + Moonshine streaming |
+| `models/` | Bundled weights (LFS): Whisper tiny/base + Moonshine streaming + sherpa |
 | `whisper_streaming/` | Submodule: [ufal/whisper_streaming](https://github.com/ufal/whisper_streaming) |
-| `HELP.md` | In-app help |
+| `sherpa_poc/` | Standalone sherpa CLI prototypes (reference) |
+| `DEVELOPMENT.md` · `HELP.md` | Developer guide · in-app help |
 
 ## License
 

@@ -19,6 +19,8 @@ venv/
 !/models/moonshine-tiny-streaming/
 !/models/moonshine-small-streaming/
 !/models/sherpa-zipformer-en-20m/
+!/models/sherpa-zipformer-en-2023-06-26/
+!/models/sherpa-zipformer-en-2023-06-21/
 !/models/sherpa-online-punct-en/
 # Transcript output dir (per-user, auto-created).
 /vtt_recordings/

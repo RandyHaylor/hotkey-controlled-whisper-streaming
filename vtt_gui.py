@@ -976,6 +976,8 @@ class VttGuiApplication:
             "moonshine-tiny-streaming": "moonshine-tiny-streaming — ~80 MB · English-only · CPU real-time streaming (fastest)",
             "moonshine-small-streaming": "moonshine-small-streaming — ~235 MB · English-only · CPU real-time streaming (more accurate)",
             "sherpa-zipformer-en-20m": "sherpa-zipformer-en-20m — ~50 MB · English-only · CPU streaming + punctuation/truecasing",
+            "sherpa-zipformer-en-2023-06-26": "sherpa-zipformer-en-2023-06-26 — ~70 MB · English-only · CPU streaming + punctuation/truecasing · more accurate than 20m",
+            "sherpa-zipformer-en-2023-06-21": "sherpa-zipformer-en-2023-06-21 — ~180 MB · English-only · CPU streaming + punctuation/truecasing · LibriSpeech+GigaSpeech, most robust",
         }
 
         # Track which models are actually present on disk so the
