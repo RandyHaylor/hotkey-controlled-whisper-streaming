@@ -1,6 +1,7 @@
 faster-whisper
 moonshine-voice
 sherpa-onnx
+pedalboard
 sounddevice
 librosa
 soundfile

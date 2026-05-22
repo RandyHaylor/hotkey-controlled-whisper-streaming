@@ -20,6 +20,7 @@ Run:
 import datetime
 import os
 import platform
+import queue
 import shutil
 import socket
 import subprocess
@@ -37,6 +38,7 @@ except Exception:  # pragma: no cover - pynput should be present per reqs
 
 import cross_platform_audio_sources as audio_sources
 import user_settings_persistence
+import microphone_input_compressor_and_level_meter as input_leveler_module
 import moonshine_streaming_backend
 
 
@@ -48,6 +50,58 @@ SERVER_READY_POLL_INTERVAL_SECONDS = 0.5
 SERVER_READY_TIMEOUT_SECONDS = 60.0
 
 TRANSCRIPTS_DIRECTORY = Path.home() / "vtt_recordings"
+
+# Global (not per-model) settings for the mic-input leveler (pre-gain knob +
+# gain knob). Applied live to the audio pump + meter, and persisted.
+INPUT_PRE_GAIN_DB_SETTING_KEY = "input_pre_gain_db"
+# First-launch default: ~1/3 of the 0..18 dB gain range.
+DEFAULT_INPUT_PRE_GAIN_DB = 6.0
+# Gain-reduction meter spans 0..this many dB of limiting.
+INPUT_REDUCTION_METER_MAX_DB = 18.0
+# Standard digital peak-meter behaviour (this is the conventional pattern, not
+# hand-tuned magic): a dBFS scale so quiet speech is visible, instant attack so
+# the bar tracks speech in real time, and a steady time-based decay (peak falls
+# the full bar in INPUT_METER_DECAY_SECONDS) for a smooth fall.
+INPUT_METER_PEAK_HOLD_SECONDS = 5.0
+INPUT_METER_REDRAW_INTERVAL_MS = 50
+INPUT_METER_DECAY_SECONDS = 0.6
+# If no new level arrives within this long, the target falls to 0 (silence).
+INPUT_METER_LEVEL_IDLE_TIMEOUT_SECONDS = 0.2
+# dB scale: this floor maps to the bottom of the bar, 0 dBFS to the top.
+INPUT_METER_FLOOR_DB = -45.0
+
+
+def reduction_db_to_meter_fraction(reduction_db, max_db=INPUT_REDUCTION_METER_MAX_DB):
+    """Map gain reduction (dB, >=0) to a 0..1 fraction for the reduction meter."""
+    if reduction_db <= 0.0:
+        return 0.0
+    return min(1.0, reduction_db / max_db)
+
+
+def amplitude_to_meter_fraction(amplitude_0_to_1, floor_db=INPUT_METER_FLOOR_DB):
+    """Map a linear 0..1 peak amplitude to a 0..1 bar fraction on a dB scale,
+    so quiet speech (e.g. 0.03 ~ -30 dBFS) sits mid-bar instead of invisibly low.
+    Pure function — unit-testable without Tk."""
+    import math
+    if amplitude_0_to_1 <= 0.0:
+        return 0.0
+    decibels = 20.0 * math.log10(amplitude_0_to_1)
+    if decibels <= floor_db:
+        return 0.0
+    if decibels >= 0.0:
+        return 1.0
+    return (decibels - floor_db) / (0.0 - floor_db)
+
+
+def compute_decayed_meter_level(previous_level, target_level, elapsed_seconds,
+                                decay_seconds):
+    """One redraw step of a standard peak meter: instant attack (jump straight up
+    to a higher target) and a steady linear decay otherwise. Frame-rate
+    independent via elapsed_seconds. Pure function — unit-testable without Tk."""
+    if target_level >= previous_level:
+        return target_level
+    decayed = previous_level - (elapsed_seconds / decay_seconds)
+    return max(target_level, decayed)
 
 LOCAL_MODELS_PARENT_DIRECTORY = Path(SCRIPT_DIRECTORY) / "models"
 DEFAULT_WHISPER_MODEL_NAME = "base"
@@ -603,6 +657,8 @@ class ModeRunner:
         on_finished,
         save_to_file_path_or_none,
         type_into_focused_window,
+        input_leveler_or_none=None,
+        on_input_peak_or_none=None,
     ):
         self.mode_label = mode_label
         self.ffmpeg_command_argv = ffmpeg_command_argv
@@ -610,10 +666,18 @@ class ModeRunner:
         self.on_finished = on_finished
         self.save_to_file_path_or_none = save_to_file_path_or_none
         self.type_into_focused_window = type_into_focused_window
+        # Optional real-time pre-gain/compressor applied to the mic PCM before it
+        # reaches the server, plus a callback to report the post-process peak to
+        # the GUI meter. None == forward raw audio unchanged.
+        self._input_leveler_or_none = input_leveler_or_none
+        self._on_input_peak_or_none = on_input_peak_or_none
 
         self._stop_requested = threading.Event()
         self._ffmpeg_process_or_none = None
         self._socket_or_none = None
+        # Hand-off between the mic-reader thread and the socket-sender thread, so
+        # the meter (updated on read) is never gated by send backpressure.
+        self._processed_audio_queue = None
         self._save_file_handle_or_none = None
         self._keyboard_controller_or_none = (
             KeyboardController() if (type_into_focused_window and KeyboardController) else None
@@ -661,12 +725,19 @@ class ModeRunner:
                     self.save_to_file_path_or_none, "a", encoding="utf-8"
                 )
 
-            sender_thread = threading.Thread(
-                target=self._pump_audio_to_server,
-                name=f"vtt-audio-pump-{self.mode_label}",
+            self._processed_audio_queue = queue.Queue()
+            mic_reader_thread = threading.Thread(
+                target=self._read_mic_audio_apply_leveler_and_meter,
+                name=f"vtt-mic-reader-{self.mode_label}",
                 daemon=True,
             )
-            sender_thread.start()
+            socket_sender_thread = threading.Thread(
+                target=self._send_processed_audio_to_server,
+                name=f"vtt-audio-sender-{self.mode_label}",
+                daemon=True,
+            )
+            mic_reader_thread.start()
+            socket_sender_thread.start()
 
             self._read_transcript_lines_from_server()
         except Exception as error:
@@ -675,17 +746,50 @@ class ModeRunner:
             self._cleanup()
             self.on_finished(self.mode_label)
 
-    def _pump_audio_to_server(self):
+    def _read_mic_audio_apply_leveler_and_meter(self):
+        """Reader thread: pull mic PCM from ffmpeg, apply the leveler
+        (gain + limiter) for the recognizer, and hand processed bytes to the
+        sender via the queue. (The level meter is driven separately by a
+        sounddevice capture, not from here.) This thread is NEVER blocked by
+        socket sends, so audio is drained from ffmpeg regardless of how the
+        recognizer consumes audio."""
         try:
             assert self._ffmpeg_process_or_none is not None
-            assert self._socket_or_none is not None
             stdout = self._ffmpeg_process_or_none.stdout
             while not self._stop_requested.is_set():
                 chunk = stdout.read(4096)
                 if not chunk:
                     break
+                if self._input_leveler_or_none is not None:
+                    chunk = self._input_leveler_or_none.\
+                        process_pcm_chunk_returning_processed_pcm(chunk)
+                    if not chunk:
+                        # Leveler is still buffering a partial block.
+                        continue
+                self._processed_audio_queue.put(chunk)
+            # Drain the leveler's buffered tail.
+            if self._input_leveler_or_none is not None:
+                tail_bytes = self._input_leveler_or_none.flush_remaining_processed_pcm()
+                if tail_bytes:
+                    self._processed_audio_queue.put(tail_bytes)
+        except Exception:
+            pass
+        finally:
+            # Sentinel: tell the sender there's no more audio.
+            self._processed_audio_queue.put(None)
+
+    def _send_processed_audio_to_server(self):
+        """Sender thread: drain processed audio to the recognizer socket. May
+        block on send backpressure (recognizer consuming in windows) without
+        affecting the reader/meter."""
+        try:
+            assert self._socket_or_none is not None
+            while True:
+                item = self._processed_audio_queue.get()
+                if item is None:
+                    break
                 try:
-                    self._socket_or_none.sendall(chunk)
+                    self._socket_or_none.sendall(item)
                 except OSError:
                     break
         except Exception:
@@ -917,10 +1021,21 @@ class VttGuiApplication:
         # Disable mode buttons until server ready.
         self._set_mode_buttons_enabled(False)
 
+        # The leveler (pre-gain + compressor) is created before its panel so the
+        # panel's knobs can drive it. None if pedalboard isn't installed.
+        self._initialize_input_leveler_and_meter_state()
+
+        # Row holding the system-log widget (left, expands) and the compact
+        # mic-input leveler panel squeezed to its right.
+        log_and_input_row_frame = tk.Frame(self.tk_root)
+        log_and_input_row_frame.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4))
+
+        self._build_input_leveler_panel(log_and_input_row_frame)
+
         # Small system-log widget (a few lines, light grey, read-only).
         # Receives [server] / [mode] / error messages — not transcript text.
         self.log_text_widget = scrolledtext.ScrolledText(
-            self.tk_root,
+            log_and_input_row_frame,
             wrap=tk.WORD,
             state=tk.DISABLED,
             font=("TkDefaultFont", 9),
@@ -929,7 +1044,7 @@ class VttGuiApplication:
             foreground="#444444",
         )
         self.log_text_widget.pack(
-            side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4)
+            side=tk.LEFT, fill=tk.X, expand=True
         )
         # Read-only log: copy / select-all only (no cut/paste).
         self._attach_right_click_context_menu_to_text_widget(
@@ -1264,6 +1379,261 @@ class VttGuiApplication:
         self.log_text_widget.insert(tk.END, text, ("emphasized_bold",))
         self.log_text_widget.see(tk.END)
         self.log_text_widget.config(state=tk.DISABLED)
+
+    # ---- Mic-input leveler (pre-gain + compressor) + level meter -----------
+
+    def _initialize_input_leveler_and_meter_state(self):
+        """Build the persistent leveler instance (driven live by the panel
+        knobs and the audio pump) and the meter's runtime state."""
+        self._input_pre_gain_db = user_settings_persistence.read_persisted_float_or_default(
+            INPUT_PRE_GAIN_DB_SETTING_KEY, DEFAULT_INPUT_PRE_GAIN_DB
+        )
+        # Gain + always-on limiter applied to the audio SENT to the recognizer.
+        self._input_leveler_or_none = self._build_input_leveler_or_none(
+            self._input_pre_gain_db
+        )
+        # SEPARATE instance for the real-time meter (captures the mic directly
+        # via sounddevice, independent of ffmpeg's ~2 s buffering). Two instances
+        # because each is processed on its own thread.
+        self._meter_leveler_or_none = self._build_input_leveler_or_none(
+            self._input_pre_gain_db
+        )
+        # Latest values from the sounddevice callback (PortAudio thread) — plain
+        # floats the Tk redraw loop polls. No cross-thread after() needed.
+        self._latest_meter_peak_amplitude = 0.0
+        self._latest_meter_reduction_db = 0.0
+        self._microphone_level_meter_stream_or_none = None
+
+        # Meter runtime state (Tk main thread): _displayed eases toward the live
+        # peak via decay ballistics; _held_peak is the 5 s peak indicator;
+        # _reduction_displayed eases the gain-reduction bar.
+        self._input_meter_displayed_level = 0.0
+        self._input_meter_held_peak = 0.0
+        self._input_meter_held_peak_monotonic = 0.0
+        self._input_meter_reduction_displayed = 0.0
+        self._input_meter_last_redraw_monotonic = 0.0
+        self._input_meter_canvas_or_none = None
+        self._reduction_meter_canvas_or_none = None
+        self._suppress_input_knob_callbacks = False
+
+    def _build_input_leveler_or_none(self, pre_gain_db):
+        """Construct the gain+limiter leveler, or None if pedalboard isn't
+        available (the pump then forwards raw audio and the panel shows a hint)."""
+        try:
+            return input_leveler_module.MicrophoneInputGainLimiterAndLevelMeter(
+                sample_rate_hz=input_leveler_module.DEFAULT_SAMPLE_RATE_HZ,
+                pre_gain_db=pre_gain_db,
+            )
+        except Exception as construction_error:
+            # Most likely: pedalboard not installed.
+            self._input_leveler_unavailable_reason = str(construction_error)
+            return None
+
+    def _start_microphone_level_meter_stream(self):
+        """Open the real-time sounddevice capture that drives the meter. Runs
+        for the life of the window. Safe no-op if it can't open (meter idles)."""
+        if self._meter_leveler_or_none is None:
+            return
+        self._microphone_level_meter_stream_or_none = (
+            input_leveler_module.RealtimeMicrophoneLevelMeterStream(
+                leveler=self._meter_leveler_or_none,
+                on_level_callback=self._record_meter_level_from_audio_thread,
+            )
+        )
+        opened = self._microphone_level_meter_stream_or_none.start()
+        if not opened:
+            self._microphone_level_meter_stream_or_none = None
+            self._append_log_text(
+                "[meter] could not open the microphone for the level meter "
+                "(it will stay idle); transcription is unaffected.\n"
+            )
+
+    def _record_meter_level_from_audio_thread(self, peak_amplitude_0_to_1, reduction_db):
+        # Called from the PortAudio callback thread. Plain float stores; the Tk
+        # redraw loop reads them. (Atomic under the GIL — no lock needed.)
+        self._latest_meter_peak_amplitude = peak_amplitude_0_to_1
+        self._latest_meter_reduction_db = reduction_db
+
+    def _build_input_leveler_panel(self, parent_frame):
+        """Compact panel squeezed to the right of the log: a live level meter
+        (5 s peak hold), a gain-reduction meter for the always-on limiter, and
+        the gain knob."""
+        from tkinter import ttk as _tk_ttk_module
+
+        panel = tk.Frame(parent_frame, bd=1, relief=tk.GROOVE)
+        panel.pack(side=tk.RIGHT, fill=tk.Y, padx=(6, 0))
+
+        if self._input_leveler_or_none is None:
+            tk.Label(
+                panel,
+                text="input leveler off\n(pip install pedalboard)",
+                font=("TkDefaultFont", 8),
+                foreground="#888888",
+                justify=tk.LEFT,
+            ).pack(side=tk.TOP, padx=4, pady=4)
+            return
+
+        self._suppress_input_knob_callbacks = True
+
+        tk.Label(panel, text="Mic input", font=("TkDefaultFont", 8, "bold")).pack(
+            side=tk.TOP, anchor=tk.W, padx=4, pady=(2, 0)
+        )
+
+        # Level meter (current level fill + a held-peak tick that resets after
+        # INPUT_METER_PEAK_HOLD_SECONDS).
+        tk.Label(panel, text="level", font=("TkDefaultFont", 7),
+                 foreground="#999999").pack(side=tk.TOP, anchor=tk.W, padx=4)
+        self._input_meter_canvas_or_none = tk.Canvas(
+            panel, width=150, height=10, background="#222222", highlightthickness=0
+        )
+        self._input_meter_canvas_or_none.pack(side=tk.TOP, padx=4, pady=(0, 2))
+
+        # Gain-reduction meter for the always-on limiter (how hard it's working).
+        tk.Label(panel, text="limiter gain reduction", font=("TkDefaultFont", 7),
+                 foreground="#999999").pack(side=tk.TOP, anchor=tk.W, padx=4)
+        self._reduction_meter_canvas_or_none = tk.Canvas(
+            panel, width=150, height=8, background="#222222", highlightthickness=0
+        )
+        self._reduction_meter_canvas_or_none.pack(side=tk.TOP, padx=4, pady=(0, 3))
+
+        def _knob_row(name, from_value, to_value, initial_value, handler,
+                      initial_value_text, left_caption, right_caption):
+            row = tk.Frame(panel)
+            row.pack(side=tk.TOP, fill=tk.X, padx=4, pady=(1, 0))
+            header = tk.Frame(row)
+            header.pack(side=tk.TOP, fill=tk.X)
+            tk.Label(header, text=name, font=("TkDefaultFont", 8, "bold")).pack(side=tk.LEFT)
+            value_label = tk.Label(header, text=initial_value_text,
+                                   font=("TkDefaultFont", 8))
+            value_label.pack(side=tk.RIGHT)
+            scale = _tk_ttk_module.Scale(
+                row, from_=from_value, to=to_value, orient=tk.HORIZONTAL,
+                length=140, command=handler,
+            )
+            scale.set(initial_value)
+            scale.pack(side=tk.TOP, fill=tk.X)
+            caption = tk.Frame(row)
+            caption.pack(side=tk.TOP, fill=tk.X)
+            tk.Label(caption, text=left_caption, font=("TkDefaultFont", 7),
+                     foreground="#999999").pack(side=tk.LEFT)
+            tk.Label(caption, text=right_caption, font=("TkDefaultFont", 7),
+                     foreground="#999999").pack(side=tk.RIGHT)
+            return scale, value_label
+
+        self._input_pre_gain_scale, self._input_pre_gain_value_label = _knob_row(
+            "Gain", input_leveler_module.MINIMUM_PRE_GAIN_DB,
+            input_leveler_module.MAXIMUM_PRE_GAIN_DB, self._input_pre_gain_db,
+            self._on_input_pre_gain_slider_changed,
+            self._format_pre_gain_value_text(self._input_pre_gain_db),
+            "+0", "+18 dB",
+        )
+
+        self._suppress_input_knob_callbacks = False
+        self._start_microphone_level_meter_stream()
+        self._schedule_input_meter_redraw()
+
+    @staticmethod
+    def _format_pre_gain_value_text(pre_gain_db):
+        return f"+{pre_gain_db:.0f} dB"
+
+    def _on_input_pre_gain_slider_changed(self, value_text):
+        if self._suppress_input_knob_callbacks:
+            return
+        pre_gain_db = float(value_text)
+        self._input_pre_gain_db = pre_gain_db
+        self._input_pre_gain_value_label.config(
+            text=self._format_pre_gain_value_text(pre_gain_db)
+        )
+        # Drive BOTH levelers: the pump's (recognizer audio) and the meter's.
+        if self._input_leveler_or_none is not None:
+            self._input_leveler_or_none.set_pre_gain_db(pre_gain_db)
+        if self._meter_leveler_or_none is not None:
+            self._meter_leveler_or_none.set_pre_gain_db(pre_gain_db)
+        user_settings_persistence.persist_float_setting(
+            INPUT_PRE_GAIN_DB_SETTING_KEY, pre_gain_db
+        )
+
+    def _schedule_input_meter_redraw(self):
+        self.tk_root.after(INPUT_METER_REDRAW_INTERVAL_MS, self._redraw_input_meter)
+
+    def _redraw_input_meter(self):
+        canvas = self._input_meter_canvas_or_none
+        if canvas is None:
+            return
+        try:
+            now = time.monotonic()
+            elapsed_seconds = (
+                now - self._input_meter_last_redraw_monotonic
+                if self._input_meter_last_redraw_monotonic
+                else INPUT_METER_REDRAW_INTERVAL_MS / 1000.0
+            )
+            self._input_meter_last_redraw_monotonic = now
+            # Live target straight from the sounddevice capture (continuous, so
+            # no idle handling needed — silence just reads low). dB-scaled so
+            # quiet speech is visible.
+            target_level = amplitude_to_meter_fraction(self._latest_meter_peak_amplitude)
+            if target_level >= self._input_meter_held_peak:
+                self._input_meter_held_peak = target_level
+                self._input_meter_held_peak_monotonic = now
+            self._input_meter_displayed_level = compute_decayed_meter_level(
+                self._input_meter_displayed_level,
+                target_level,
+                elapsed_seconds,
+                INPUT_METER_DECAY_SECONDS,
+            )
+            # Peak indicator resets after the hold window.
+            if now - self._input_meter_held_peak_monotonic > INPUT_METER_PEAK_HOLD_SECONDS:
+                self._input_meter_held_peak = self._input_meter_displayed_level
+                self._input_meter_held_peak_monotonic = now
+
+            width = int(canvas.cget("width"))
+            height = int(canvas.cget("height"))
+            current = min(1.0, max(0.0, self._input_meter_displayed_level))
+            held = min(1.0, max(0.0, self._input_meter_held_peak))
+
+            canvas.delete("all")
+            level_pixels = int(current * width)
+            # No red: the always-on limiter hard-caps output at 0 dBFS (verified),
+            # so the signal can't actually clip — the bar reaching the top just
+            # means the limiter is working (watch the reduction meter for that).
+            # Green for normal levels, yellow as it nears the top.
+            fill_color = "#e2c23b" if current >= 0.85 else "#3bd17a"
+            if level_pixels > 0:
+                canvas.create_rectangle(0, 0, level_pixels, height,
+                                        fill=fill_color, width=0)
+            held_x = min(width - 1, int(held * width))
+            if held_x > 0:
+                canvas.create_line(held_x, 0, held_x, height,
+                                   fill="#ffffff", width=2)
+
+            # Gain-reduction meter (eased with the same decay ballistics).
+            reduction_canvas = self._reduction_meter_canvas_or_none
+            if reduction_canvas is not None:
+                reduction_target = reduction_db_to_meter_fraction(
+                    self._latest_meter_reduction_db
+                )
+                self._input_meter_reduction_displayed = compute_decayed_meter_level(
+                    self._input_meter_reduction_displayed,
+                    reduction_target,
+                    elapsed_seconds,
+                    INPUT_METER_DECAY_SECONDS,
+                )
+                r_width = int(reduction_canvas.cget("width"))
+                r_height = int(reduction_canvas.cget("height"))
+                r_pixels = int(min(1.0, max(0.0, self._input_meter_reduction_displayed)) * r_width)
+                reduction_canvas.delete("all")
+                if r_pixels > 0:
+                    # Anchored to the RIGHT edge, growing leftward as the limiter
+                    # pulls the signal down (standard gain-reduction meter).
+                    reduction_canvas.create_rectangle(
+                        r_width - r_pixels, 0, r_width, r_height,
+                        fill="#e2913b", width=0
+                    )
+        except tk.TclError:
+            # Window/canvas went away (app closing) — stop the loop.
+            self._input_meter_canvas_or_none = None
+            return
+        self._schedule_input_meter_redraw()
 
     def _set_active_device_button_highlight(self, active_device_or_none):
         """Highlight the GPU or CPU server button based on which device the
@@ -2238,6 +2608,11 @@ class VttGuiApplication:
                 f"{MODE_FILE_PREFIX[mode_label]}_{timestamp}.txt"
             )
 
+        # Start each capture with a clean leveler buffer/envelope so it doesn't
+        # inherit stale audio from the previous run.
+        if self._input_leveler_or_none is not None:
+            self._input_leveler_or_none.reset_stream()
+
         runner = ModeRunner(
             mode_label=mode_label,
             ffmpeg_command_argv=ffmpeg_command_argv,
@@ -2245,6 +2620,9 @@ class VttGuiApplication:
             on_finished=self._on_runner_finished_threadsafe,
             save_to_file_path_or_none=save_path_or_none,
             type_into_focused_window=(mode_label == MODE_MIC_TYPING),
+            input_leveler_or_none=self._input_leveler_or_none,
+            # Meter is driven by its own sounddevice capture, not the pump.
+            on_input_peak_or_none=None,
         )
         runner.start()
         self.active_mode_runner_or_none = runner
@@ -2294,6 +2672,12 @@ class VttGuiApplication:
     # ---- Shutdown ---------------------------------------------------------
 
     def _on_window_close(self):
+        try:
+            if self._microphone_level_meter_stream_or_none is not None:
+                self._microphone_level_meter_stream_or_none.stop()
+        except Exception:
+            pass
+
         try:
             with self.runner_state_lock:
                 self._stop_active_runner_holding_lock()

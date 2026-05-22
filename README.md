@@ -116,13 +116,21 @@ pipelines. Its live partials show in the server console window.
   - Model dropdown — switch Whisper / Moonshine / sherpa model (auto-restarts server).
   - **One settings panel shows only the active model's settings** and swaps when you change the model. Hover tooltips (with typical ranges); **Restore defaults** resets that model.
     - Saved instantly **per specific model**; **apply on next server restart** (a "⚠ changed" notice shows until then). Editing a number then clicking anywhere applies it.
+- **Mic input panel** (right of the log) — a real-time level meter + a **Gain**
+  knob (0…+18 dB) for lifting quiet speech. An always-on limiter caps peaks just
+  below full scale; its **gain-reduction meter** (right-anchored, grows left)
+  shows how hard it's working. The meter taps the mic directly (sounddevice), so
+  it tracks your voice live, independent of the recognizer. Needs `pedalboard`
+  (`pip install pedalboard`); without it the panel shows a hint and audio passes
+  through unchanged.
 - **Transcript** — editable pane; Clear / Copy all; right-click for Cut/Copy/Paste/Select All.
 - **Help** — in-app `HELP.md` viewer. Status row shows server UP/DOWN + mode.
 
 ## Settings persistence
 
 - Saved to `~/.voice-to-text-type-tally/settings.json` (cross-platform), restored on launch.
-- Remembers the global device (GPU/CPU) + selected model, and **per-model** tunables (`settings["models"][<model>][...]`). Legacy flat settings are migrated automatically on first launch.
+- Remembers the global device (GPU/CPU) + selected model, the **input gain** knob,
+  and **per-model** tunables (`settings["models"][<model>][...]`). Legacy flat settings are migrated automatically on first launch.
 
 ## Contributing / internals
 
@@ -142,6 +150,7 @@ known gotchas.
 | `vtt_gui.py` | Cross-platform tkinter GUI (main entry point) |
 | `cross_platform_audio_sources.py` | Audio capture helpers (Linux/Mac/Windows) |
 | `user_settings_persistence.py` | Per-model settings JSON (read/write/migrate) |
+| `microphone_input_compressor_and_level_meter.py` | Mic gain + limiter + real-time level/reduction metering (sounddevice + pedalboard) |
 | `whisper_streaming_server_runner_with_device_choice.py` | Whisper server wrapper (GPU/CPU) |
 | `moonshine_streaming_server.py` · `moonshine_streaming_backend.py` | Moonshine streaming server + engine |
 | `sherpa_streaming_server.py` · `sherpa_streaming_backend.py` | sherpa streaming server + engine (CPU; streaming/whole-sentence) |

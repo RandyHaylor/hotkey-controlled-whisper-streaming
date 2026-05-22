@@ -56,6 +56,10 @@ def _common_ffmpeg_output_args_for_raw_pcm():
         "-ar", str(TARGET_SAMPLE_RATE_HZ),
         "-f", TARGET_PCM_FORMAT_NAME,
         "-acodec", "pcm_s16le",
+        # Flush each packet to the pipe immediately. Without this, ffmpeg hoards
+        # ~64 KB (~2 s of 16k mono PCM) before writing, which makes the live
+        # meter (and any real-time consumer) update in ~2 s bursts.
+        "-flush_packets", "1",
         "-loglevel", "error",
         "-",
     ]
