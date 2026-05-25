@@ -23,9 +23,15 @@ add an engine, models/LFS, tests, and known gotchas. User-facing usage is in
 ## Data flow
 
 ```
-mic / system audio
+mic-only modes:
+   → sounddevice / PortAudio direct capture
+     (microphone_sounddevice_capture_source.py)        # real-time, ~20 ms blocks
+system-audio / mixed modes:
    → ffmpeg (cross_platform_audio_sources.py builds the cmd)
+     (pulse loopback / amix; ~2 s capture buffer is acceptable here)
+
    → raw s16le 16 kHz mono PCM
+   → input leveler (gain + always-on limiter, optional)
    → TCP 127.0.0.1:43007  (SERVER_HOST/SERVER_PORT in vtt_gui.py)
    → <engine> server
         ↓  committed text
@@ -33,6 +39,13 @@ mic / system audio
    → GUI ModeRunner reads + parse_transcript_line() → types (pynput) /
      appends to ~/vtt_recordings/*.txt / prints in the window
 ```
+
+The mic-mode capture was originally ffmpeg+pulse but that path measured ~2.0 s
+of cold-start before any audio reached the recognizer plus ~2 s bursty delivery
+(PulseAudio default buffering, persistent across `-flush_packets`/`fragment_size`
+tweaks). `MicrophoneSoundDeviceCaptureSource` exposes `.read(n)` / `.close()` so
+it drops straight into the existing reader thread in place of an ffmpeg
+subprocess's stdout — no other plumbing changes.
 
 - **Wire protocol (engine → GUI):** UTF-8 lines terminated by `\n`, each
   `"<begin_ms> <end_ms> <text>"`. The GUI's `parse_transcript_line()` splits on

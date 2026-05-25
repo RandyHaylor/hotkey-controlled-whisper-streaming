@@ -39,6 +39,7 @@ except Exception:  # pragma: no cover - pynput should be present per reqs
 import cross_platform_audio_sources as audio_sources
 import user_settings_persistence
 import microphone_input_compressor_and_level_meter as input_leveler_module
+import microphone_sounddevice_capture_source as microphone_capture_module
 import moonshine_streaming_backend
 
 
@@ -180,27 +181,28 @@ SHERPA_TUNABLE_OPTION_SPECS = (
         ),
     },
     {
-        "key": "sherpa_context_window_words", "kind": "float", "default": 32.0,
+        "key": "sherpa_context_window_words", "kind": "float", "default": 16.0,
         "label": "Context words",
         "help": (
             "Read-only recent words handed to the punctuation model for better "
-            "punctuation decisions (streaming mode).\nTypical: 16–48."
+            "punctuation decisions (streaming mode). Tighter context = less "
+            "re-evaluation churn at the locking edge.\nTypical: 8–24."
         ),
     },
     {
-        "key": "sherpa_mutable_suffix_words", "kind": "float", "default": 4.0,
+        "key": "sherpa_mutable_suffix_words", "kind": "float", "default": 1.0,
         "label": "Mutable suffix",
         "help": (
             "Trailing words that stay editable before locking (streaming mode). "
-            "Larger = more in-flight coherence, more delay.\nTypical: 2–8."
+            "Larger = more in-flight coherence, more delay.\nTypical: 1–4."
         ),
     },
     {
-        "key": "sherpa_stability_delay_words", "kind": "float", "default": 3.0,
+        "key": "sherpa_stability_delay_words", "kind": "float", "default": 1.0,
         "label": "Stability delay",
         "help": (
             "Extra cooling words before a word locks into the never-rewritten "
-            "prefix (streaming mode).\nTypical: 1–5."
+            "prefix (streaming mode).\nTypical: 1–3."
         ),
     },
 )
@@ -659,6 +661,7 @@ class ModeRunner:
         type_into_focused_window,
         input_leveler_or_none=None,
         on_input_peak_or_none=None,
+        direct_microphone_audio_source_or_none=None,
     ):
         self.mode_label = mode_label
         self.ffmpeg_command_argv = ffmpeg_command_argv
@@ -671,6 +674,11 @@ class ModeRunner:
         # the GUI meter. None == forward raw audio unchanged.
         self._input_leveler_or_none = input_leveler_or_none
         self._on_input_peak_or_none = on_input_peak_or_none
+        # When provided (mic-only modes), the reader pulls PCM straight from this
+        # sounddevice source instead of spawning ffmpeg — bypasses ffmpeg's ~2 s
+        # PulseAudio capture buffer. System-audio / mixed modes pass None and use
+        # ffmpeg the old way (pulse loopback is required there).
+        self._direct_microphone_audio_source_or_none = direct_microphone_audio_source_or_none
 
         self._stop_requested = threading.Event()
         self._ffmpeg_process_or_none = None
@@ -691,10 +699,16 @@ class ModeRunner:
 
     def stop(self):
         self._stop_requested.set()
-        # Kill ffmpeg first; closing socket will unblock recv.
+        # Stop whichever audio source the reader is blocked in: ffmpeg pipe or
+        # sounddevice direct capture. Closing the source unblocks read().
         if self._ffmpeg_process_or_none is not None:
             try:
                 self._ffmpeg_process_or_none.terminate()
+            except Exception:
+                pass
+        if self._direct_microphone_audio_source_or_none is not None:
+            try:
+                self._direct_microphone_audio_source_or_none.close()
             except Exception:
                 pass
         if self._socket_or_none is not None:
@@ -714,11 +728,14 @@ class ModeRunner:
             )
             self._socket_or_none.settimeout(None)
 
-            self._ffmpeg_process_or_none = subprocess.Popen(
-                self.ffmpeg_command_argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-            )
+            # Mic-only modes have a direct sounddevice source; ffmpeg is only
+            # needed for system-audio / mixed modes (pulse loopback / amix).
+            if self._direct_microphone_audio_source_or_none is None:
+                self._ffmpeg_process_or_none = subprocess.Popen(
+                    self.ffmpeg_command_argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
 
             if self.save_to_file_path_or_none is not None:
                 self._save_file_handle_or_none = open(
@@ -754,10 +771,16 @@ class ModeRunner:
         socket sends, so audio is drained from ffmpeg regardless of how the
         recognizer consumes audio."""
         try:
-            assert self._ffmpeg_process_or_none is not None
-            stdout = self._ffmpeg_process_or_none.stdout
+            # Pick the audio source: sounddevice direct (mic modes, real-time) or
+            # the ffmpeg subprocess's stdout (system-audio / mixed). Both expose
+            # the same read(n) interface.
+            if self._direct_microphone_audio_source_or_none is not None:
+                audio_source = self._direct_microphone_audio_source_or_none
+            else:
+                assert self._ffmpeg_process_or_none is not None
+                audio_source = self._ffmpeg_process_or_none.stdout
             while not self._stop_requested.is_set():
-                chunk = stdout.read(4096)
+                chunk = audio_source.read(4096)
                 if not chunk:
                     break
                 if self._input_leveler_or_none is not None:
@@ -852,6 +875,11 @@ class ModeRunner:
                     self._ffmpeg_process_or_none.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     self._ffmpeg_process_or_none.kill()
+            except Exception:
+                pass
+        if self._direct_microphone_audio_source_or_none is not None:
+            try:
+                self._direct_microphone_audio_source_or_none.close()
             except Exception:
                 pass
         if self._socket_or_none is not None:
@@ -2187,13 +2215,13 @@ class VttGuiApplication:
         )
         mode = "streaming" if streaming_mode_enabled else "whole_sentence"
         context_window_words = user_settings_persistence.read_model_float_or_default(
-            model_name, "sherpa_context_window_words", 32
+            model_name, "sherpa_context_window_words", 16
         )
         mutable_suffix_words = user_settings_persistence.read_model_float_or_default(
-            model_name, "sherpa_mutable_suffix_words", 4
+            model_name, "sherpa_mutable_suffix_words", 1
         )
         stability_delay_words = user_settings_persistence.read_model_float_or_default(
-            model_name, "sherpa_stability_delay_words", 3
+            model_name, "sherpa_stability_delay_words", 1
         )
         return [
             sys.executable,
@@ -2613,6 +2641,22 @@ class VttGuiApplication:
         if self._input_leveler_or_none is not None:
             self._input_leveler_or_none.reset_stream()
 
+        # Mic-only modes get a direct sounddevice capture (no ffmpeg/pulse cold
+        # start, no 2 s burst cadence). System-audio / mixed modes still use
+        # ffmpeg because they need the pulse loopback / amix.
+        direct_mic_source_or_none = None
+        if audio_source_name == "mic":
+            try:
+                direct_mic_source_or_none = (
+                    microphone_capture_module.MicrophoneSoundDeviceCaptureSource()
+                )
+            except Exception as direct_capture_error:
+                self._append_log_text(
+                    "[capture] direct mic capture unavailable "
+                    f"({direct_capture_error}); falling back to ffmpeg.\n"
+                )
+                direct_mic_source_or_none = None
+
         runner = ModeRunner(
             mode_label=mode_label,
             ffmpeg_command_argv=ffmpeg_command_argv,
@@ -2623,6 +2667,7 @@ class VttGuiApplication:
             input_leveler_or_none=self._input_leveler_or_none,
             # Meter is driven by its own sounddevice capture, not the pump.
             on_input_peak_or_none=None,
+            direct_microphone_audio_source_or_none=direct_mic_source_or_none,
         )
         runner.start()
         self.active_mode_runner_or_none = runner

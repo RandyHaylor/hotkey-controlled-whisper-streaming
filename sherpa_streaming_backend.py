@@ -32,9 +32,13 @@ from typing import Callable, List, Tuple
 SHERPA_AUDIO_SAMPLE_RATE_HZ = 16000
 
 # Default stable-prefix (streaming) window sizes — exposed as tunables.
-DEFAULT_CONTEXT_WINDOW_WORDS = 32
-DEFAULT_MUTABLE_SUFFIX_WORDS = 4
-DEFAULT_STABILITY_DELAY_WORDS = 3
+# Aggressive low-latency defaults: lock_distance = mutable + delay = 2 (commit
+# each word after just 2 words of right-context) and a tighter context window
+# so the punctuation model re-evaluates less per block. Tested most stable on
+# real speech with the larger 180 MB sherpa model.
+DEFAULT_CONTEXT_WINDOW_WORDS = 16
+DEFAULT_MUTABLE_SUFFIX_WORDS = 1
+DEFAULT_STABILITY_DELAY_WORDS = 1
 
 
 # ---- Model loading ---------------------------------------------------------
