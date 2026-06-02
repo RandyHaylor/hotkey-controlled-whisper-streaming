@@ -118,6 +118,22 @@ subprocess's stdout — no other plumbing changes.
 - Mode + tunables come from per-model settings (CLI flags `--mode`,
   `--context-window-words`, ...). The server prints live partials to its
   console (stderr) as feedback.
+- **Responsiveness preset** (`SHERPA_RESPONSIVENESS_PRESETS` in `vtt_gui.py`)
+  bundles context_window + mutable_suffix + stability_delay + rule2 silence into
+  a single choice (stable/balanced/fast). When the preset is not `custom`, the
+  argv builder ignores the raw knobs and emits the preset's values.
+- **ONNX Runtime provider** (`sherpa_onnxruntime_provider`, cpu/cuda) is threaded
+  to both `OnlineRecognizer.from_transducer` and `OnlinePunctuation` via the
+  `onnxruntime_provider` keyword. `cuda` requires `onnxruntime-gpu`; sherpa
+  falls back to CPU automatically if cuda is unavailable.
+- **Silero VAD (optional)**: `build_silero_voice_activity_detector_from_local_model_directory()`
+  wraps sherpa-onnx's `VoiceActivityDetector` over the bundled
+  `models/sherpa-silero-vad/silero_vad.onnx`. The server tracks the
+  speech→silence transition per chunk; on transition AND non-empty raw text it
+  force-commits the segment immediately, bypassing the recognizer's
+  rule2_min_trailing_silence timer. Toggled per-model via
+  `sherpa_enable_silero_vad`; the GUI only passes `--enable-silero-vad` when the
+  VAD model file is actually present, so a stale setting can't crash the server.
 
 ## Per-model settings system
 

@@ -91,8 +91,27 @@ SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET = {
     ),
 }
 
+
+class SherpaSingleFileDownloadSpec:
+    """A single .onnx file dropped into models/<local_dir_name>/<file_name>.
+    Used for small standalone models like Silero VAD (no tarball wrapper)."""
+
+    def __init__(self, file_url, local_dir_name, local_file_name):
+        self.file_url = file_url
+        self.local_dir_name = local_dir_name
+        self.local_file_name = local_file_name
+
+
+SHERPA_SINGLE_FILE_DOWNLOAD_SPECS_BY_TARGET = {
+    "vad": SherpaSingleFileDownloadSpec(
+        file_url=f"{K2_RELEASE_BASE_URL}/asr-models/silero_vad.onnx",
+        local_dir_name="sherpa-silero-vad",
+        local_file_name="silero_vad.onnx",
+    ),
+}
+
 # What `main()` downloads when given no arguments (the committed bundle).
-DEFAULT_TARGETS = ("asr", "punct")
+DEFAULT_TARGETS = ("asr", "punct", "vad")
 
 
 def _download_extract_and_copy(spec: SherpaModelDownloadSpec):
@@ -114,16 +133,33 @@ def _download_extract_and_copy(spec: SherpaModelDownloadSpec):
             print(f"[sherpa-download] -> {destination_directory / filename}", flush=True)
 
 
+def _download_single_file(spec: SherpaSingleFileDownloadSpec):
+    destination_directory = LOCAL_MODELS_PARENT_DIRECTORY / spec.local_dir_name
+    destination_directory.mkdir(parents=True, exist_ok=True)
+    destination_file_path = destination_directory / spec.local_file_name
+    print(f"[sherpa-download] fetching {spec.file_url} ...", flush=True)
+    urllib.request.urlretrieve(spec.file_url, destination_file_path)
+    print(f"[sherpa-download] -> {destination_file_path}", flush=True)
+
+
 def main():
     requested = sys.argv[1:] or list(DEFAULT_TARGETS)
     if requested == ["all"]:
-        requested = list(SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET.keys())
+        requested = (
+            list(SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET.keys())
+            + list(SHERPA_SINGLE_FILE_DOWNLOAD_SPECS_BY_TARGET.keys())
+        )
     for target in requested:
-        spec = SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET.get(target)
-        if spec is None:
-            valid = ", ".join(SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET.keys())
+        if target in SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET:
+            _download_extract_and_copy(SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET[target])
+        elif target in SHERPA_SINGLE_FILE_DOWNLOAD_SPECS_BY_TARGET:
+            _download_single_file(SHERPA_SINGLE_FILE_DOWNLOAD_SPECS_BY_TARGET[target])
+        else:
+            valid = ", ".join(
+                list(SHERPA_MODEL_DOWNLOAD_SPECS_BY_TARGET.keys())
+                + list(SHERPA_SINGLE_FILE_DOWNLOAD_SPECS_BY_TARGET.keys())
+            )
             raise SystemExit(f"unknown target '{target}' (use one of: {valid}, all)")
-        _download_extract_and_copy(spec)
     print("[sherpa-download] done.", flush=True)
 
 

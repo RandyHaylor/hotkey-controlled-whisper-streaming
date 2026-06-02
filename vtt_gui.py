@@ -169,6 +169,30 @@ WHISPER_TUNABLE_OPTION_SPECS = (
 
 # User-tunable sherpa-onnx settings (its own engine). Same dict shape as the
 # Whisper specs (kinds: flag/float). All apply on server restart.
+# Bundled values for the `sherpa_responsiveness` preset. lock_distance =
+# mutable_suffix + stability_delay (right-context words held before commit).
+SHERPA_RESPONSIVENESS_PRESETS = {
+    "stable": {
+        "context_window_words": 24,
+        "mutable_suffix_words": 2,
+        "stability_delay_words": 2,     # lock_distance = 4
+        "rule2_min_trailing_silence": 1.2,
+    },
+    "balanced": {
+        "context_window_words": 16,
+        "mutable_suffix_words": 1,
+        "stability_delay_words": 1,     # lock_distance = 2 — live-tested sweet spot
+        "rule2_min_trailing_silence": 0.8,
+    },
+    "fast": {
+        "context_window_words": 12,
+        "mutable_suffix_words": 1,
+        "stability_delay_words": 0,     # lock_distance = 1 — minimum latency
+        "rule2_min_trailing_silence": 0.4,
+    },
+}
+
+
 SHERPA_TUNABLE_OPTION_SPECS = (
     {
         "key": "sherpa_streaming_mode", "kind": "flag", "default": True,
@@ -178,6 +202,41 @@ SHERPA_TUNABLE_OPTION_SPECS = (
             "is editable, older text locks. Low latency.\n"
             "OFF = whole-sentence mode: nothing appears until you pause, then a "
             "full punctuated/truecased segment — most accurate punctuation."
+        ),
+    },
+    {
+        "key": "sherpa_responsiveness", "kind": "choice", "default": "balanced",
+        "choices": ["stable", "balanced", "fast", "custom"],
+        "label": "Responsiveness",
+        "help": (
+            "Preset that bundles the locking + endpoint + context knobs (streaming "
+            "mode):\n"
+            "  stable    — conservative, fewer late rewrites.\n"
+            "  balanced  — default (live-tested most stable on the 180 MB model).\n"
+            "  fast      — minimum latency, may show more in-flight changes.\n"
+            "  custom    — use the raw knobs below as-is."
+        ),
+    },
+    {
+        "key": "sherpa_onnxruntime_provider", "kind": "choice", "default": "cpu",
+        "choices": ["cpu", "cuda"],
+        "label": "ONNX Runtime",
+        "help": (
+            "Execution provider for sherpa's ONNX models.\n"
+            "  cpu  — always works.\n"
+            "  cuda — requires `onnxruntime-gpu` installed; sherpa falls back to "
+            "CPU automatically if cuda isn't available."
+        ),
+    },
+    {
+        "key": "sherpa_enable_silero_vad", "kind": "flag", "default": False,
+        "label": "Silero VAD (faster endpoint)",
+        "help": (
+            "ON = also run Silero VAD on the mic stream. When VAD detects the "
+            "speech->silence transition it commits the current segment "
+            "immediately, instead of waiting for the recognizer's rule timer. "
+            "Cuts the commit-after-pause latency. Requires the sherpa-silero-vad "
+            "model directory to be present."
         ),
     },
     {
@@ -385,6 +444,7 @@ SHERPA_MODEL_INSTALLED_MARKER_FILENAME = "tokens.txt"
 # The sherpa punctuation/truecasing model lives in its own companion dir; it is
 # NOT a selectable model, so exclude it from discovery.
 SHERPA_PUNCTUATION_MODEL_DIRECTORY_NAME = "sherpa-online-punct-en"
+SHERPA_SILERO_VAD_MODEL_DIRECTORY_NAME = "sherpa-silero-vad"
 
 
 def is_directory_an_installed_local_model_directory(candidate_directory):
@@ -394,6 +454,8 @@ def is_directory_an_installed_local_model_directory(candidate_directory):
     if not candidate_directory.is_dir():
         return False
     if candidate_directory.name == SHERPA_PUNCTUATION_MODEL_DIRECTORY_NAME:
+        return False
+    if candidate_directory.name == SHERPA_SILERO_VAD_MODEL_DIRECTORY_NAME:
         return False
     if (candidate_directory / FASTER_WHISPER_MODEL_INSTALLED_MARKER_FILENAME).is_file():
         return True
@@ -2214,16 +2276,46 @@ class VttGuiApplication:
             )
         )
         mode = "streaming" if streaming_mode_enabled else "whole_sentence"
-        context_window_words = user_settings_persistence.read_model_float_or_default(
-            model_name, "sherpa_context_window_words", 16
+
+        # Responsiveness preset overrides the raw locking + endpoint knobs unless
+        # set to "custom". rule2_min_trailing_silence is included in the preset
+        # so endpointing speed tracks responsiveness too.
+        responsiveness_preset = user_settings_persistence.read_model_string_or_default(
+            model_name, "sherpa_responsiveness", "balanced"
         )
-        mutable_suffix_words = user_settings_persistence.read_model_float_or_default(
-            model_name, "sherpa_mutable_suffix_words", 1
+        if responsiveness_preset != "custom":
+            preset_values = SHERPA_RESPONSIVENESS_PRESETS[responsiveness_preset]
+            context_window_words = preset_values["context_window_words"]
+            mutable_suffix_words = preset_values["mutable_suffix_words"]
+            stability_delay_words = preset_values["stability_delay_words"]
+            rule2_min_trailing_silence = preset_values["rule2_min_trailing_silence"]
+        else:
+            context_window_words = user_settings_persistence.read_model_float_or_default(
+                model_name, "sherpa_context_window_words", 16
+            )
+            mutable_suffix_words = user_settings_persistence.read_model_float_or_default(
+                model_name, "sherpa_mutable_suffix_words", 1
+            )
+            stability_delay_words = user_settings_persistence.read_model_float_or_default(
+                model_name, "sherpa_stability_delay_words", 1
+            )
+            rule2_min_trailing_silence = 1.2  # backend default
+
+        onnxruntime_provider = user_settings_persistence.read_model_string_or_default(
+            model_name, "sherpa_onnxruntime_provider", "cpu"
         )
-        stability_delay_words = user_settings_persistence.read_model_float_or_default(
-            model_name, "sherpa_stability_delay_words", 1
+
+        silero_vad_model_directory = (
+            LOCAL_MODELS_PARENT_DIRECTORY / SHERPA_SILERO_VAD_MODEL_DIRECTORY_NAME
         )
-        return [
+        enable_silero_vad = user_settings_persistence.read_model_bool_or_default(
+            model_name, "sherpa_enable_silero_vad", False
+        )
+        # Only pass --enable-silero-vad if the model directory actually exists,
+        # so a stale setting doesn't crash the server.
+        vad_is_available = (silero_vad_model_directory / "silero_vad.onnx").is_file()
+
+        argv = [
             sys.executable,
             sherpa_server_script_path,
             "--host", SERVER_HOST,
@@ -2234,8 +2326,15 @@ class VttGuiApplication:
             "--context-window-words", str(int(context_window_words)),
             "--mutable-suffix-words", str(int(mutable_suffix_words)),
             "--stability-delay-words", str(int(stability_delay_words)),
+            "--rule2-min-trailing-silence", f"{rule2_min_trailing_silence:.3f}",
+            "--onnxruntime-provider", onnxruntime_provider,
             "-l", "INFO",
         ]
+        if vad_is_available:
+            argv += ["--silero-vad-model-dir", str(silero_vad_model_directory)]
+            if enable_silero_vad:
+                argv += ["--enable-silero-vad"]
+        return argv
 
     def _build_whisper_server_command_argv(
         self, whisper_model_name, local_model_directory

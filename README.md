@@ -102,10 +102,25 @@ python vtt_gui.py
 
 ### sherpa engine
 
-`sherpa-zipformer-en-20m` is a separate, CPU-only streaming engine
-(sherpa-onnx) with two output modes (streaming rolling-window, default; or
-whole-sentence punctuated). It does **not** share the Whisper/Moonshine
-pipelines. Its live partials show in the server console window.
+Three bundled English streaming Zipformer models (`sherpa-zipformer-en-20m`
+plus the larger 2023-06-26 and 2023-06-21 variants). Two output modes
+(streaming rolling-window, default; or whole-sentence punctuated). It does
+**not** share the Whisper/Moonshine pipelines. Its live partials show in the
+server console window.
+
+Per-model knobs:
+- **Responsiveness preset** — `stable / balanced (default) / fast / custom`.
+  Bundles the locking + endpoint + context-window settings together. `balanced`
+  matches what we live-tested most stable on the 180 MB model. `custom` falls
+  back to the raw knobs below.
+- **ONNX Runtime** — `cpu` (default) or `cuda` if `onnxruntime-gpu` is
+  installed; sherpa falls back to CPU automatically if cuda is unavailable.
+- **Silero VAD (faster endpoint)** — optional. When on, the bundled
+  `sherpa-silero-vad/silero_vad.onnx` runs alongside the recognizer and forces
+  an immediate commit on the speech→silence transition instead of waiting for
+  the recognizer's rule timer. Cuts post-pause commit latency.
+- Raw locking knobs (Context words / Mutable suffix / Stability delay) — used
+  only when Responsiveness is `custom`.
 
 ## GUI reference
 

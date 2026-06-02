@@ -29,6 +29,7 @@ from sherpa_streaming_backend import (
     StablePrefixAdapter,
     WholeSegmentFormatter,
     build_punctuation_truecaser_from_local_model_directory,
+    build_silero_voice_activity_detector_from_local_model_directory,
     build_streaming_recognizer_from_local_model_directory,
 )
 
@@ -62,10 +63,16 @@ class IncrementalCapitalizer:
 
 
 class SherpaConnectionHandler:
-    def __init__(self, connected_socket, recognizer, punctuator, parsed_args):
+    def __init__(self, connected_socket, recognizer, punctuator,
+                 voice_activity_detector_or_none, parsed_args):
         self._socket = connected_socket
         self._recognizer = recognizer
         self._punctuator = punctuator
+        # Optional Silero VAD. When present, used as a faster end-of-speech
+        # signal: on the speech->silence transition we force-commit and reset
+        # the recognizer instead of waiting for its rule-based endpoint timer.
+        self._voice_activity_detector_or_none = voice_activity_detector_or_none
+        self._previous_voice_activity_state_was_speech = False
         self._args = parsed_args
         self._stream = recognizer.create_stream()
         self._sample_clock = 0  # samples received, for begin/end_ms
@@ -129,12 +136,37 @@ class SherpaConnectionHandler:
             self._recognizer.decode_stream(self._stream)
         self._commit_segment(self._recognizer.get_result(self._stream))
 
+    def _check_voice_activity_endpoint_or_none(self, samples):
+        """If VAD is loaded, feed it the chunk and return True when the chunk
+        marks a transition from speech -> silence (i.e., end-of-speech detected
+        sooner than the recognizer's rule2 timer)."""
+        if self._voice_activity_detector_or_none is None:
+            return False
+        try:
+            self._voice_activity_detector_or_none.accept_waveform(samples)
+            is_speech_now = bool(
+                self._voice_activity_detector_or_none.is_speech_detected()
+            )
+        except Exception:
+            return False
+        end_of_speech_transition = (
+            self._previous_voice_activity_state_was_speech and not is_speech_now
+        )
+        self._previous_voice_activity_state_was_speech = is_speech_now
+        return end_of_speech_transition
+
     def _feed(self, samples):
+        voice_activity_signalled_endpoint = (
+            self._check_voice_activity_endpoint_or_none(samples)
+        )
         self._stream.accept_waveform(SHERPA_AUDIO_SAMPLE_RATE_HZ, samples)
         while self._recognizer.is_ready(self._stream):
             self._recognizer.decode_stream(self._stream)
         raw = self._recognizer.get_result(self._stream)
-        if self._recognizer.is_endpoint(self._stream):
+        if (
+            self._recognizer.is_endpoint(self._stream)
+            or (voice_activity_signalled_endpoint and raw.strip())
+        ):
             self._commit_segment(raw)
             self._recognizer.reset(self._stream)
             return
@@ -171,6 +203,16 @@ def _parse_args():
     p.add_argument("--stability-delay-words", dest="stability_delay_words", type=int, default=3)
     p.add_argument("--rule2-min-trailing-silence", dest="rule2_min_trailing_silence",
                    type=float, default=1.2)
+    p.add_argument("--onnxruntime-provider", dest="onnxruntime_provider",
+                   choices=["cpu", "cuda"], default="cpu",
+                   help="ONNX Runtime execution provider. 'cuda' needs onnxruntime-gpu "
+                        "installed; sherpa falls back to CPU if cuda is unavailable.")
+    p.add_argument("--silero-vad-model-dir", dest="silero_vad_model_dir", default=None,
+                   help="Directory containing silero_vad.onnx. When set AND "
+                        "--enable-silero-vad is on, VAD provides a faster "
+                        "end-of-speech signal than the recognizer's rule timer.")
+    p.add_argument("--enable-silero-vad", dest="enable_silero_vad",
+                   action="store_true", default=False)
     p.add_argument("-l", "--log-level", dest="log_level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"])
     return p.parse_args()
@@ -181,15 +223,35 @@ def main():
     logging.basicConfig(format="%(levelname)s\t%(message)s")
     logger.setLevel(args.log_level)
 
-    logger.info("Loading sherpa ASR from %s ...", args.model_dir)
+    logger.info("Loading sherpa ASR from %s (provider=%s) ...",
+                args.model_dir, args.onnxruntime_provider)
     recognizer = build_streaming_recognizer_from_local_model_directory(
         args.model_dir,
         num_threads=args.num_threads,
         rule2_min_trailing_silence=args.rule2_min_trailing_silence,
+        onnxruntime_provider=args.onnxruntime_provider,
     )
     logger.info("Loading sherpa punctuation from %s ...", args.punct_dir)
-    punctuator = build_punctuation_truecaser_from_local_model_directory(args.punct_dir)
-    logger.info("sherpa ready (CPU, mode=%s).", args.mode)
+    punctuator = build_punctuation_truecaser_from_local_model_directory(
+        args.punct_dir, onnxruntime_provider=args.onnxruntime_provider
+    )
+    voice_activity_detector_or_none = None
+    if args.enable_silero_vad and args.silero_vad_model_dir:
+        try:
+            logger.info("Loading Silero VAD from %s ...", args.silero_vad_model_dir)
+            voice_activity_detector_or_none = (
+                build_silero_voice_activity_detector_from_local_model_directory(
+                    args.silero_vad_model_dir,
+                    onnxruntime_provider=args.onnxruntime_provider,
+                )
+            )
+        except Exception as vad_load_error:
+            logger.warning("Silero VAD failed to load (%s); continuing without it.",
+                           vad_load_error)
+            voice_activity_detector_or_none = None
+    logger.info("sherpa ready (provider=%s, mode=%s, vad=%s).",
+                args.onnxruntime_provider, args.mode,
+                "on" if voice_activity_detector_or_none else "off")
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listening_socket:
         listening_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -200,7 +262,8 @@ def main():
             connected_socket, client_address = listening_socket.accept()
             logger.info("Client connected from %s", client_address)
             handler = SherpaConnectionHandler(
-                connected_socket, recognizer, punctuator, args
+                connected_socket, recognizer, punctuator,
+                voice_activity_detector_or_none, args
             )
             try:
                 handler.process_until_disconnect()

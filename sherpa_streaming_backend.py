@@ -59,9 +59,12 @@ def build_streaming_recognizer_from_local_model_directory(
     rule1_min_trailing_silence: float = 2.4,
     rule2_min_trailing_silence: float = 1.2,
     rule3_min_utterance_length: float = 300.0,
+    onnxruntime_provider: str = "cpu",
 ):
     """Load a streaming Zipformer transducer from a local model dir. Prefers
-    int8 component files; falls back to float. Endpoint detection always on."""
+    int8 component files; falls back to float. Endpoint detection always on.
+    `onnxruntime_provider` is 'cpu' (default) or 'cuda' if onnxruntime-gpu is
+    installed (sherpa-onnx falls back to CPU automatically if cuda unavailable)."""
     import sherpa_onnx
 
     def pick(component):
@@ -80,7 +83,7 @@ def build_streaming_recognizer_from_local_model_directory(
         sample_rate=SHERPA_AUDIO_SAMPLE_RATE_HZ,
         feature_dim=80,
         decoding_method=decoding_method,
-        provider="cpu",
+        provider=onnxruntime_provider,
         enable_endpoint_detection=True,
         rule1_min_trailing_silence=rule1_min_trailing_silence,
         rule2_min_trailing_silence=rule2_min_trailing_silence,
@@ -88,7 +91,39 @@ def build_streaming_recognizer_from_local_model_directory(
     )
 
 
-def build_punctuation_truecaser_from_local_model_directory(model_directory: str):
+def build_silero_voice_activity_detector_from_local_model_directory(
+    model_directory: str,
+    onnxruntime_provider: str = "cpu",
+    speech_threshold: float = 0.5,
+    minimum_silence_duration_seconds: float = 0.25,
+    minimum_speech_duration_seconds: float = 0.25,
+    voice_activity_buffer_seconds: float = 30.0,
+):
+    """Load sherpa-onnx's Silero VAD wrapper from a local model dir (expects
+    `silero_vad.onnx`). Returns a `VoiceActivityDetector` configured for 16 kHz
+    mono input — same rate as the ASR path."""
+    import sherpa_onnx
+
+    vad_model_path = _find_one_model_file(model_directory, "silero_vad.onnx")
+    config = sherpa_onnx.VadModelConfig(
+        silero_vad=sherpa_onnx.SileroVadModelConfig(
+            model=vad_model_path,
+            threshold=float(speech_threshold),
+            min_silence_duration=float(minimum_silence_duration_seconds),
+            min_speech_duration=float(minimum_speech_duration_seconds),
+        ),
+        sample_rate=SHERPA_AUDIO_SAMPLE_RATE_HZ,
+        num_threads=1,
+        provider=onnxruntime_provider,
+    )
+    return sherpa_onnx.VoiceActivityDetector(
+        config, buffer_size_in_seconds=float(voice_activity_buffer_seconds)
+    )
+
+
+def build_punctuation_truecaser_from_local_model_directory(
+    model_directory: str, onnxruntime_provider: str = "cpu"
+):
     """Load the online punctuation + truecasing model from a local dir."""
     import sherpa_onnx
 
@@ -104,7 +139,7 @@ def build_punctuation_truecaser_from_local_model_directory(model_directory: str)
                 cnn_bilstm=model_file,
                 bpe_vocab=bpe_vocab_file,
                 num_threads=1,
-                provider="cpu",
+                provider=onnxruntime_provider,
             )
         )
     )
